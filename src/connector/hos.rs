@@ -321,7 +321,8 @@ impl Connector for HosConnector {
         let since: i64 = hw.last_key.as_deref().unwrap_or("0").parse().unwrap_or(0);
         let sql = format!(
             "SELECT TOP {limit} sh.ID, CAST(sh.Branch AS INT), CAST(sh.TransNo AS INT), CAST(sh.Station AS INT), sh.TransType, \
-                    sh.Supplier, sh.InvoiceNo, CAST(sh.TotalCost AS FLOAT), CONVERT(varchar(23), sh.Logged, 121) \
+                    sh.Supplier, sh.InvoiceNo, CAST(sh.TotalCost AS FLOAT), CONVERT(varchar(23), sh.Logged, 121), \
+                    CAST(sh.POID AS NVARCHAR(40)), CAST(sh.OriginatingTransNo AS INT) \
              FROM SMHeaders sh \
              WHERE sh.TransType IN ('P','G','I','Z') AND sh.ID > {since} \
              ORDER BY sh.ID ASC");
@@ -355,6 +356,11 @@ impl Connector for HosConnector {
                 invoice_no: gs(&r, 6),
                 total_cost: gf(&r, 7),
                 logged: gstr(&r, 8),
+                poid: gs(&r, 9),
+                originating_trans_no: {
+                    let v = gi(&r, 10);
+                    (v != 0).then_some(v)
+                },
                 lines: parsed_lines,
             });
         }

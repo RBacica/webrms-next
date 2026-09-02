@@ -103,6 +103,11 @@ impl Poller {
             Ok(_) => {}
             Err(e) => { tracing::warn!("poll: receipts failed: {e}"); ok = false; }
         }
+        // incoming-PO lifecycle: flip waiting_import→pending_receipt→receipted
+        // from the freshly pulled receipts (G-7)
+        if let Err(e) = crate::modules::incoming_po::auto_flip(pool).await {
+            tracing::warn!("poll: incoming-po auto-flip failed: {e}");
+        }
         match ingest::ingest_ap(pool, c, src).await {
             Ok(n) if n > 0 => tracing::info!("poll: ap +{n}"),
             Ok(_) => {}

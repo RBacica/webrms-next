@@ -24,7 +24,7 @@ pub fn routes() -> axum::Router<SharedState> {
         .route("/api/ordering/sheet", axum::routing::get(sheet))
         .route("/api/ordering/orders", axum::routing::get(list_orders).post(post_order))
         .route("/api/ordering/confirmation-csv", axum::routing::get(confirmation_csv))
-        .route("/api/sync/incoming-po", axum::routing::get(incoming_po))
+        .route("/api/sync/incoming-po", axum::routing::get(incoming_po).delete(delete_incoming_po))
 }
 
 #[derive(Deserialize)]
@@ -185,10 +185,11 @@ async fn post_order(
     if let Err(e) = sqlx::query(
         "INSERT INTO incoming_pos (id, origin_install, branch_id, supplier_id, filename, \
                 bill_of_lading, poid, status, imported, placed_at) \
-         VALUES (?1, 'local', ?2, NULL, ?3, ?4, ?5, 'waiting_import', 0, ?6)",
+         VALUES (?1, 'local', ?2, ?3, ?4, ?5, ?6, 'waiting_import', 0, ?7)",
     )
     .bind(uuid::Uuid::new_v4().to_string())
     .bind(branch)
+    .bind(sup_id)
     .bind(&filename)
     .bind(&bol)
     .bind(poid)
@@ -285,18 +286,54 @@ async fn confirmation_csv(
 
 /// Incoming PO list with status (W5): files tracked in incoming_pos.
 async fn incoming_po(State(state): State<SharedState>) -> impl IntoResponse {
-    let files: Vec<serde_json::Value> = sqlx::query_as::<_, (String, i64, Option<String>, String, Option<String>)>(
-        "SELECT filename, branch_id, bill_of_lading, status, placed_at FROM incoming_pos ORDER BY placed_at DESC",
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map(|r| {
-        r.into_iter()
-            .map(|(filename, branch_id, bol, status, placed_at)| {
-                json!({ "filename": filename, "branch_id": branch_id, "bill_of_lading": bol, "status": status, "placed_at": placed_at })
-            })
-            .collect()
-    })
-    .unwrap_or_default();
-    (StatusCode::OK, Json(json!({ "incoming": files })))
+    match crate::modules::incoming_po::list(&state.pool).await {
+        Ok(files) => (StatusCode::OK, Json(json!({ "incoming": files }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
+        ),
+    }
+}
+
+/// Delete an incoming-PO record + file (HoS only — BoS/Remote-HoS 403).
+#[derive(Deserialize)]
+struct DeletePoQuery {
+    filename: String,
+}
+
+async fn delete_incoming_po(
+    State(state): State<SharedState>,
+    Query(query): Query<DeletePoQuery>,
+) -> impl IntoResponse {
+    let is_hos = state
+        .server_info
+        .read()
+        .map(|i| i.mode == crate::state::ServerMode::Hos)
+        .unwrap_or(false);
+    if !is_hos {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Incoming-PO deletion is Head Office only." })),
+        );
+    }
+    // delete the physical file from output/incoming-po/<branch>/ if present
+    if let Ok(dir) = std::fs::read_dir(state.data_dir.join("output/incoming-po")) {
+        for branch_dir in dir.filter_map(|e| e.ok()) {
+            let f = branch_dir.path().join(&query.filename);
+            if f.exists() {
+                std::fs::remove_file(&f).ok();
+                break;
+            }
+        }
+    }
+    match crate::modules::incoming_po::remove(&state.pool, &query.filename).await {
+        Ok(n) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "removed": n, "filename": query.filename })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
+        ),
+    }
 }

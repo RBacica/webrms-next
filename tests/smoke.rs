@@ -544,3 +544,63 @@ async fn reports_overview_and_depts() {
     assert!(v.as_array().unwrap().iter().any(|d| d["dept_name"] == "Total"), "body: {body}");
     assert!(v.as_array().unwrap()[0]["this_week_gross"].as_f64().unwrap() > 0.0, "body: {body}");
 }
+
+// ── P2-6: incoming-PO lifecycle — waiting_import → pending_receipt → receipted ─
+
+async fn seed_incoming_po_data(pool: &sqlx::SqlitePool) {
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(pool).await.unwrap();
+    // a PO we generated, still waiting for import
+    sqlx::query(
+        "INSERT INTO incoming_pos (id, origin_install, branch_id, supplier_id, filename, bill_of_lading, poid, status, imported, placed_at) \
+         VALUES ('po-1', 'local', 2, 1, 'PurchaseOrder-010-2-20260902-120000-ABC123.xlsx', 'ABC123', 123456, 'waiting_import', 0, '2026-09-02 12:00:00')"
+    ).execute(pool).await.unwrap();
+    // a PO NOT ours (no poid match) — must stay waiting_import
+    sqlx::query(
+        "INSERT INTO incoming_pos (id, origin_install, branch_id, supplier_id, filename, bill_of_lading, poid, status, imported, placed_at) \
+         VALUES ('po-2', 'local', 2, 1, 'PurchaseOrder-010-2-20260902-130000-DEF456.xlsx', 'DEF456', 999999, 'waiting_import', 0, '2026-09-02 13:00:00')"
+    ).execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn incoming_po_auto_flip_lifecycle() {
+    let (_app, tmp) = seed_app_with(|pool| Box::pin(async move { seed_incoming_po_data(&pool).await })).await;
+    // seed_app_with calls init_pool(tmp.path()) → the DB is <tmp>/data.db
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+
+    // stage 1: Infinity imports the PO → a 'P' receipt with our POID appears
+    sqlx::query(
+        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, poid) \
+         VALUES (2, 5000, 1, 'P', 1, 'P-5000', 1000.0, '2026-09-02 14:00:00', '123456')"
+    ).execute(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    assert_eq!(flipped, 1, "only our PO flips");
+    let status: String = sqlx::query_scalar("SELECT status FROM incoming_pos WHERE id = 'po-1'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "pending_receipt");
+    let status2: String = sqlx::query_scalar("SELECT status FROM incoming_pos WHERE id = 'po-2'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(status2, "waiting_import", "foreign PO untouched");
+
+    // stage 2: goods-in arrives, linked to the P via OriginatingTransNo
+    sqlx::query(
+        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, poid, originating_trans_no) \
+         VALUES (2, 6000, 1, 'G', 1, 'G-6000', 1000.0, '2026-09-02 16:00:00', '123456', 5000)"
+    ).execute(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    assert_eq!(flipped, 1);
+    let status: String = sqlx::query_scalar("SELECT status FROM incoming_pos WHERE id = 'po-1'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "receipted");
+
+    // list shows both with supplier codes (ordered placed_at DESC → po-2 first)
+    let list = webrms_next::modules::incoming_po::list(&pool).await.unwrap();
+    assert_eq!(list.len(), 2);
+    let ours = list.iter().find(|p| p["poid"] == 123456).unwrap();
+    assert_eq!(ours["status"], "receipted");
+    assert_eq!(ours["supplier_code"], "010");
+    let foreign = list.iter().find(|p| p["poid"] == 999999).unwrap();
+    assert_eq!(foreign["status"], "waiting_import");
+}

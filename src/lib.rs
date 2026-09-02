@@ -8,7 +8,6 @@ pub mod poller;
 pub mod server;
 pub mod state;
 pub mod util;
-
 use axum::Router;
 use state::SharedState;
 
