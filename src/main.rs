@@ -47,9 +47,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run => run().await,
         Commands::Init => init().await,
         Commands::Service { action } => service(action).await,
-        Commands::Seed { source } => {
-            anyhow::bail!("seed not implemented until P1 (connector core) — source '{source}'")
-        }
+        Commands::Seed { source } => seed(&source).await,
         Commands::Doctor => {
             tracing::warn!("doctor not implemented until P4");
             Ok(())
@@ -215,4 +213,24 @@ async fn service(action: ServiceAction) -> anyhow::Result<()> {
         ServiceAction::Stop => svc::stop().await,
         ServiceAction::Remove => svc::remove().await,
     }
+}
+
+/// Full connector seed: pull a live AKPOS system into the local DB (resumable).
+async fn seed(source: &str) -> anyhow::Result<()> {
+    init_tracing();
+    let (cfg, _) = AppConfig::load()?;
+    if cfg.database.connection_string.is_empty() {
+        anyhow::bail!("no [database] connection_string configured — set it in config.toml to seed from a live system");
+    }
+    let data_dir = cfg.data_dir_abs();
+    std::fs::create_dir_all(&data_dir)?;
+    let pool = webrms_next::db::init_pool(&data_dir).await?;
+
+    let conn = webrms_next::connector::hos::HosConnector::new(cfg.database.connection_string);
+    let conn = &conn;
+
+    println!("seeding from '{source}' → {}", data_dir.display());
+    webrms_next::ingest::run_seed(&pool, conn, source).await?;
+    println!("✓ seed complete");
+    Ok(())
 }

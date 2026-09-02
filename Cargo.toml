@@ -19,6 +19,9 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 anyhow = "1"
+tiberius = { version = "0.12", features = ["tds73", "native-tls", "chrono"] }
+futures-util = "0.3.34"
+tokio-util = { version = "0.7.19", features = ["compat"] }
 # Windows service (SCM-native, headless --service mode). Windows-only; no-op elsewhere.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

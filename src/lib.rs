@@ -1,5 +1,7 @@
 pub mod config;
+pub mod connector;
 pub mod db;
+pub mod ingest;
 pub mod server;
 pub mod state;
 
