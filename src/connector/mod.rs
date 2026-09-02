@@ -37,6 +37,8 @@ pub trait Connector: Send + Sync {
     async fn pull_receipts(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveReceipt>>;
     async fn pull_ap(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveApInvoice>>;
     async fn pull_promos(&self) -> anyhow::Result<Vec<LivePromoRule>>;
+    async fn pull_pricing_groups(&self) -> anyhow::Result<Vec<LivePricingGroup>>;
+    async fn pull_pricing_sets(&self) -> anyhow::Result<Vec<LivePricingSet>>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +183,7 @@ pub struct LivePromoRule {
     /// 'special' (Standard engine) | 'rbp_condition' (Rules_Based engine)
     pub kind: String,
     pub source_key: String,
+    pub description: Option<String>,
     pub sequence_match: Option<String>,
     pub condition_type: Option<String>,
     pub adjustment_type: Option<String>,
@@ -190,4 +193,22 @@ pub struct LivePromoRule {
     pub branch_scope: Option<i32>,
     pub inactive: bool,
     pub payload: String, // raw JSON of the source row
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePricingGroup {
+    pub group_id: i64,
+    pub description: String,
+    pub data_key: String, // item UPC (Type='Items')
+    pub type_: String,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePricingSet {
+    pub set_id: i64,
+    pub set_line: i64,
+    pub group_id: i64,
+    pub min_qty: f64,
+    pub max_qty: f64,
 }

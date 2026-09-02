@@ -262,13 +262,19 @@ pub async fn ingest_promos<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, s
     let mut tx = pool.begin().await?;
     for p in &promos {
         sqlx::query(
-            "INSERT INTO promo_rules (kind, source, source_key, payload, sequence_match, \
+            "INSERT INTO promo_rules (kind, source, source_key, description, payload, sequence_match, \
                     condition_type, adjustment_type, adjustment_value, effective_start, \
                     effective_end, branch_scope, is_active, last_synced_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now')) \
-             ON CONFLICT DO NOTHING",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now')) \
+             ON CONFLICT(kind, source, source_key) DO UPDATE SET \
+               description=excluded.description, payload=excluded.payload, \
+               sequence_match=excluded.sequence_match, condition_type=excluded.condition_type, \
+               adjustment_type=excluded.adjustment_type, adjustment_value=excluded.adjustment_value, \
+               effective_start=excluded.effective_start, effective_end=excluded.effective_end, \
+               branch_scope=excluded.branch_scope, is_active=excluded.is_active, \
+               last_synced_at=excluded.last_synced_at",
         )
-        .bind(&p.kind).bind(source).bind(&p.source_key).bind(&p.payload)
+        .bind(&p.kind).bind(source).bind(&p.source_key).bind(&p.description).bind(&p.payload)
         .bind(&p.sequence_match).bind(&p.condition_type).bind(&p.adjustment_type)
         .bind(p.adjustment_value).bind(&p.effective_start).bind(&p.effective_end)
         .bind(p.branch_scope).bind(!p.inactive)
@@ -278,6 +284,35 @@ pub async fn ingest_promos<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, s
     tx.commit().await?;
     tracing::info!("promos: {n} rows");
     Ok(n as u64)
+}
+
+/// RBP set/group materialization (wipe-reload — small reference tables;
+/// upsert would leave stale rows behind).
+pub async fn ingest_rbp<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
+    let groups = conn.pull_pricing_groups().await?;
+    let sets = conn.pull_pricing_sets().await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM pricing_groups").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM pricing_sets").execute(&mut *tx).await?;
+    for g in &groups {
+        sqlx::query(
+            "INSERT INTO pricing_groups (group_id, description, data_key, type, is_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(g.group_id).bind(&g.description).bind(&g.data_key).bind(&g.type_).bind(g.is_active)
+        .execute(&mut *tx).await?;
+    }
+    for s in &sets {
+        sqlx::query(
+            "INSERT INTO pricing_sets (set_id, set_line, group_id, min_qty, max_qty) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(s.set_id).bind(s.set_line).bind(s.group_id).bind(s.min_qty).bind(s.max_qty)
+        .execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    tracing::info!("rbp: {} groups, {} sets (source {source})", groups.len(), sets.len());
+    Ok((groups.len() + sets.len()) as u64)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -399,7 +434,8 @@ pub async fn run_seed<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source
     let receipts = ingest_receipts(pool, conn, source).await?;
     let ap = ingest_ap(pool, conn, source).await?;
     let promos = ingest_promos(pool, conn, source).await?;
+    let rbp = ingest_rbp(pool, conn, source).await?;
 
-    tracing::info!("=== seed complete: items={items} stock={stock} sales={sales} receipts={receipts} ap={ap} promos={promos} ===");
+    tracing::info!("=== seed complete: items={items} stock={stock} sales={sales} receipts={receipts} ap={ap} promos={promos} rbp={rbp} ===");
     Ok(())
 }

@@ -20,6 +20,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(crate::modules::stocktake::handlers::routes())
         .merge(crate::modules::ordering::handlers::routes())
         .merge(crate::modules::payables::handlers::routes())
+        .merge(crate::modules::promotions::handlers::routes())
         .with_state(state)
 }
 

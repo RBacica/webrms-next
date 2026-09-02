@@ -113,6 +113,11 @@ impl Poller {
             Ok(_) => {}
             Err(e) => { tracing::warn!("poll: promos failed: {e}"); ok = false; }
         }
+        match ingest::ingest_rbp(pool, c, src).await {
+            Ok(n) if n > 0 => tracing::info!("poll: rbp +{n}"),
+            Ok(_) => {}
+            Err(e) => { tracing::warn!("poll: rbp failed: {e}"); ok = false; }
+        }
 
         // Record status for /api/health + UI badges (D3)
         let mut st = self.status.write().unwrap_or_else(|e| e.into_inner());

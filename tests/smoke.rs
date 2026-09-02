@@ -396,3 +396,80 @@ async fn payables_mark_paid_and_config() {
     let (_, body) = get(&app, "/api/payables/config").await;
     assert!(body.contains("\"term_days\":30"), "config: {body}");
 }
+
+// ── P2-4: promotions — list / items / effectiveness over local promo_rules ───
+
+async fn seed_promo_data(pool: &sqlx::SqlitePool) {
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, upc, sku, description, cost, price1, pack_units, is_active) VALUES \
+         (1, '5010677014205', 'S1', 'Jameson 1L', 40.0, 59.99, 6, 1), \
+         (2, '5010677025812', 'S2', 'Bacardi 1L', 36.0, 52.99, 12, 1)"
+    ).execute(pool).await.unwrap();
+    // RBP condition: bare UPC promo $49.99 — window RELATIVE to today so the
+    // seeded sales (last 28 days) overlap it: promo = last 8 days, base = 8 days before
+    let today = chrono::Local::now().date_naive();
+    let promo_start = (today - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
+    let promo_end = today.format("%Y-%m-%d").to_string();
+    sqlx::query(
+        "INSERT INTO promo_rules (id, kind, source, source_key, description, payload, sequence_match, condition_type, \
+                adjustment_type, adjustment_value, effective_start, effective_end, branch_scope, is_active) VALUES \
+         (1, 'rbp_condition', 'connector', '2808', 'ABS 2x', '{}', '5010677014205', 'RETAIL', 'ABS', 49.99, \
+          ?1, ?2, NULL, 1)"
+    ).bind(&promo_start).bind(&promo_end)
+    .execute(pool).await.unwrap();
+    // sales: promo window 10 units @ 49.99, base window 5 units @ 59.99
+    let mut tx = pool.begin().await.unwrap();
+    for d in 0..28 {
+        let date = (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+        let (units, promo_units, revenue, price) = if d < 8 {
+            (4.0, 4.0, 4.0 * 49.99, 49.99) // promo window: 32 units total
+        } else if d < 16 {
+            (2.0, 0.0, 2.0 * 59.99, 59.99) // base window: 16 units total
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        if units > 0.0 {
+            sqlx::query(
+                "INSERT INTO sales_daily (branch_id, upc, sale_date, units, revenue, promo_units, normal_units, cost_amount, line_margin) \
+                 VALUES (2, '5010677014205', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            ).bind(&date).bind(units).bind(revenue).bind(promo_units).bind(units - promo_units)
+             .bind(units * 40.0).bind(revenue - units * 40.0).execute(&mut *tx).await.unwrap();
+        }
+        let _ = price;
+    }
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn promotions_list_and_effectiveness() {
+    let (app, _tmp) = seed_app_with(|pool| Box::pin(async move { seed_promo_data(&pool).await })).await;
+    // engine + list
+    let (status, body) = get(&app, "/api/promotions/list").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["active"], 1);
+    assert_eq!(v["promotions"][0]["scope"], "UPC");
+    assert_eq!(v["promotions"][0]["price"].as_f64().unwrap(), 49.99);
+    // items resolve
+    let (status, body) = get(&app, "/api/promotions/items?id=pc-1").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["resolvable"], true);
+    let item = &v["items"][0];
+    assert_eq!(item["upc"], "5010677014205");
+    assert!(item["discount_pct"].as_f64().unwrap() < 0.0, "promo below Price1 → negative");
+    // effectiveness: promo 32 units vs base 16 → uplift 2.0
+    let today = chrono::Local::now().date_naive();
+    let from = (today - chrono::Duration::days(40)).format("%Y-%m-%d").to_string();
+    let to = today.format("%Y-%m-%d").to_string();
+    let (status, body) = get(&app, &format!("/api/promotions/effectiveness?from={from}&to={to}&branch=2")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let s = &v["specials"][0];
+    assert_eq!(s["promo_units"].as_f64().unwrap(), 32.0, "body: {body}");
+    assert_eq!(s["base_units"].as_f64().unwrap(), 16.0, "body: {body}");
+    assert!((s["uplift_units"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+}

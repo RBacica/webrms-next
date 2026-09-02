@@ -416,6 +416,7 @@ impl Connector for HosConnector {
             Ok(rows.iter().map(|r| LivePromoRule {
                 kind: "rbp_condition".into(),
                 source_key: gi(&r, 0).to_string(),
+                description: gs(&r, 9),
                 sequence_match: gs(&r, 2),
                 condition_type: gs(&r, 1),
                 adjustment_type: gs(&r, 3),
@@ -434,6 +435,7 @@ impl Connector for HosConnector {
             Ok(rows.iter().map(|r| LivePromoRule {
                 kind: "special".into(),
                 source_key: format!("{}|{}", gstr(&r, 0), gstr(&r, 1)),
+                description: None, // Specials has no description column
                 sequence_match: gs(&r, 0),
                 condition_type: gs(&r, 1),
                 adjustment_type: gs(&r, 4),
@@ -445,5 +447,33 @@ impl Connector for HosConnector {
                 payload: String::new(),
             }).collect())
         }
+    }
+
+    async fn pull_pricing_groups(&self) -> anyhow::Result<Vec<LivePricingGroup>> {
+        let mut client = self.connect().await?;
+        let rows = query_rows(&mut client,
+            "SELECT GroupID, ISNULL(Description, ''), ISNULL(DataKey, ''), ISNULL(Type, ''), ISNULL(InActive, 0) \
+             FROM PricingGroup WHERE ISNULL(InActive, 0) = 0 AND ISNULL(DataKey, '') <> ''").await?;
+        Ok(rows.iter().map(|r| LivePricingGroup {
+            group_id: gi(&r, 0),
+            description: gstr(&r, 1),
+            data_key: gstr(&r, 2),
+            type_: gstr(&r, 3),
+            is_active: !gb(&r, 4),
+        }).collect())
+    }
+
+    async fn pull_pricing_sets(&self) -> anyhow::Result<Vec<LivePricingSet>> {
+        let mut client = self.connect().await?;
+        let rows = query_rows(&mut client,
+            "SELECT SetID, SetLine, GroupID, CAST(MinQuantity AS FLOAT), CAST(MaxQuantity AS FLOAT) \
+             FROM PricingProductSet ORDER BY SetID, SetLine").await?;
+        Ok(rows.iter().map(|r| LivePricingSet {
+            set_id: gi(&r, 0),
+            set_line: gi(&r, 1),
+            group_id: gi(&r, 2),
+            min_qty: gf(&r, 3),
+            max_qty: gf(&r, 4),
+        }).collect())
     }
 }
