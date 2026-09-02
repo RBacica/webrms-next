@@ -1,0 +1,2 @@
+// Feature modules, ported from WebRMS onto the local SQLite DB.
+pub mod stocktake;

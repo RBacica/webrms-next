@@ -1,10 +1,13 @@
 pub mod config;
 pub mod connector;
 pub mod db;
+pub mod files;
 pub mod ingest;
+pub mod modules;
 pub mod poller;
 pub mod server;
 pub mod state;
+pub mod util;
 
 use axum::Router;
 use state::SharedState;
