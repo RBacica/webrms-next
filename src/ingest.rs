@@ -13,7 +13,7 @@ pub const BATCH: i64 = 5000;
 
 /// Full reference pull (branches, departments, suppliers) — small tables,
 /// always pulled wholesale. Writes provenance rows + maps ext ids.
-pub async fn ingest_reference<C: Connector>(
+pub async fn ingest_reference<C: Connector + ?Sized>(
     pool: &SqlitePool,
     conn: &C,
     source: &str,
@@ -70,7 +70,7 @@ pub async fn ingest_reference<C: Connector>(
 
 /// Incremental pull for one table. Reads its high-water mark, pulls batches
 /// until the source is exhausted, committing each batch (resumable).
-pub async fn ingest_items<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
+pub async fn ingest_items<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
     let mut hw = load_hw(pool, source, "items").await?;
     let mut total: u64 = 0;
     loop {
@@ -94,7 +94,7 @@ pub async fn ingest_items<C: Connector>(pool: &SqlitePool, conn: &C, source: &st
     Ok(total)
 }
 
-pub async fn ingest_stock<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
+pub async fn ingest_stock<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
     // stock_current is rebuilt wholesale per branch on every poll (fresh
     // on-hand = latest movement per UPC). No high-water needed.
     let branch_ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM branches WHERE is_active = 1")
@@ -121,7 +121,7 @@ pub async fn ingest_stock<C: Connector>(pool: &SqlitePool, conn: &C, source: &st
     Ok(total)
 }
 
-pub async fn ingest_sales<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
+pub async fn ingest_sales<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
     let mut hw = load_hw(pool, source, "sales").await?;
     let mut total: u64 = 0;
     loop {
@@ -165,7 +165,7 @@ pub async fn ingest_sales<C: Connector>(pool: &SqlitePool, conn: &C, source: &st
     Ok(total)
 }
 
-pub async fn ingest_receipts<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
+pub async fn ingest_receipts<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
     let mut hw = load_hw(pool, source, "receipts").await?;
     let mut total: u64 = 0;
     loop {
@@ -212,7 +212,7 @@ pub async fn ingest_receipts<C: Connector>(pool: &SqlitePool, conn: &C, source: 
     Ok(total)
 }
 
-pub async fn ingest_ap<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
+pub async fn ingest_ap<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
     let mut hw = load_hw(pool, source, "ap").await?;
     let mut total: u64 = 0;
     loop {
@@ -257,7 +257,7 @@ pub async fn ingest_ap<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) 
     Ok(total)
 }
 
-pub async fn ingest_promos<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
+pub async fn ingest_promos<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
     let promos = conn.pull_promos().await?;
     let mut tx = pool.begin().await?;
     for p in &promos {
@@ -376,13 +376,24 @@ async fn count(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, table: &str) -> any
 }
 
 /// Run a full seed from a connector into the app DB.
-pub async fn run_seed<C: Connector>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<()> {
+pub async fn run_seed<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<()> {
     tracing::info!("=== seed start (source={source}) ===");
     let probe = conn.probe().await.context("probe failed — is the live system reachable?")?;
     tracing::info!("probe: engine={} branches={:?}", probe.engine, probe.branch_ids);
 
     ingest_reference(pool, conn, source).await?;
     let items = ingest_items(pool, conn, source).await?;
+    // Reset the items high-water to Updated-mode ("|" = ts mode from start) so
+    // incremental polls catch EDITS to existing UPCs, not just new ones. The
+    // first poll re-pulls the catalog once (idempotent upserts), then settles.
+    sqlx::query(
+        "INSERT INTO high_watermarks (source, table_name, last_key, updated_at) \
+         VALUES (?1, 'items', '|', datetime('now')) \
+         ON CONFLICT(source, table_name) DO UPDATE SET last_key='|', updated_at=datetime('now')",
+    )
+    .bind(source)
+    .execute(pool)
+    .await?;
     let stock = ingest_stock(pool, conn, source).await?;
     let sales = ingest_sales(pool, conn, source).await?;
     let receipts = ingest_receipts(pool, conn, source).await?;

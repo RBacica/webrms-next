@@ -49,6 +49,19 @@ pub struct AppState {
     pub cfg: AppConfig,
     pub data_dir: PathBuf,
     pub server_info: RwLock<ServerInfo>,
+    /// Connector poller (None when sync/connector disabled — standalone mode).
+    pub poller: RwLock<Option<crate::poller::PollerHandle>>,
+}
+
+/// Poll status reported by the connector loop (for /api/health + UI badges).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PollStatus {
+    pub last_success: Option<String>,
+    pub last_error: Option<String>,
+    pub tick_count: u64,
+    pub connector_enabled: bool,
+    pub last_items: u64,
+    pub last_sales: u64,
 }
 
 impl AppState {
@@ -66,6 +79,7 @@ impl AppState {
             cfg,
             data_dir,
             server_info: RwLock::new(info),
+            poller: RwLock::new(None),
         })
     }
 

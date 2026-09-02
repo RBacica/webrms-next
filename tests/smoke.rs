@@ -59,8 +59,9 @@ async fn version_endpoint_reports_schema() {
     let (status, body) = get(&app, "/api/version").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("\"name\":\"webrms-next\""), "body: {body}");
-    // 0001_init.sql = exactly 1 migration
-    assert!(body.contains("\"schema\":1"), "body: {body}");
+    // schema count must match the embedded migrations (0001_init, 0002_promo_unique)
+    let n = webrms_next::db::MIGRATOR.iter().count();
+    assert!(body.contains(&format!("\"schema\":{n}")), "body: {body} (expected {n})");
 }
 
 #[tokio::test]

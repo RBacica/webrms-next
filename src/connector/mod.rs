@@ -22,10 +22,8 @@ pub struct PullResult<T> {
 }
 
 /// Core connector trait. Every method is a pure read from a live system.
-/// Async (native async fn in trait — Rust 1.75+); implementations open a
-/// fresh connection per call (fine at 15-min poll cadence; a pooled variant
-/// can come later without trait changes).
-#[allow(async_fn_in_trait)] // trait not dyn-compatible; intentional
+/// Async-trait keeps it dyn-compatible (the poller holds `Box<dyn PollConn>`).
+#[async_trait::async_trait]
 pub trait Connector: Send + Sync {
     async fn probe(&self) -> anyhow::Result<ProbeInfo>;
 

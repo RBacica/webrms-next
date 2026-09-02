@@ -1,7 +1,7 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
@@ -15,6 +15,8 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/mode", get(mode))
         .route("/api/branches", get(branches))
         .route("/api/version", get(version))
+        .route("/api/sync/now", post(sync_now))
+        .route("/api/sync/status", get(sync_status))
         .with_state(state)
 }
 
@@ -35,14 +37,23 @@ fn info(state: &SharedState) -> ServerInfo {
 async fn health(State(state): State<SharedState>) -> impl IntoResponse {
     let db_ok = db::ping(&state.pool).await;
     let info = info(&state);
+    let poll = state.poller.read().map(|p| p.as_ref().map(|h| h.status())).unwrap_or(None);
+    let (connector, last_poll) = match &poll {
+        Some(st) => (
+            if st.last_error.is_some() { "error" } else { "ok" }.to_string(),
+            st.last_success.clone(),
+        ),
+        None => ("disabled".to_string(), None),
+    };
     (
         StatusCode::OK,
         Json(json!({
             "status": if db_ok { "ok" } else { "degraded" },
             "db": db_ok,
             "mode": info.mode.as_str(),
-            "connector": "n/a",      // P1: last-success age
-            "snapshot": "n/a",       // P3: snapshot staleness
+            "connector": connector,
+            "last_poll": last_poll,
+            "snapshot": "n/a",      // P3: snapshot staleness
             "replication": "n/a",    // P3: replication lag
             "version": env!("CARGO_PKG_VERSION"),
         })),
@@ -67,6 +78,52 @@ async fn version() -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "schema": crate::db::MIGRATOR.iter().count(),
     }))
+}
+
+/// Manual "Sync now" — trigger a connector tick immediately (O-2).
+async fn sync_now(State(state): State<SharedState>) -> impl IntoResponse {
+    let handle = state.poller.read().map(|p| p.clone()).unwrap_or(None);
+    match handle {
+        Some(h) => match h.tick_now().await {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "message": "sync tick completed" })),
+            ),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": format!("{e}") })),
+            ),
+        },
+        None => (
+            StatusCode::CONFLICT,
+            Json(json!({ "ok": false, "error": "connector not configured (standalone mode)" })),
+        ),
+    }
+}
+
+/// Connector poll status (for UI badges + ops).
+async fn sync_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let handle = state.poller.read().map(|p| p.clone()).unwrap_or(None);
+    match handle {
+        Some(h) => {
+            let st = h.status();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "enabled": st.connector_enabled,
+                    "tick_count": st.tick_count,
+                    "last_success": st.last_success,
+                    "last_error": st.last_error,
+                    "last_items": st.last_items,
+                    "last_sales": st.last_sales,
+                })),
+            )
+        }
+        None => (
+            StatusCode::OK,
+            Json(json!({ "enabled": false, "tick_count": 0 })),
+        ),
+    }
 }
 
 async fn branches(State(state): State<SharedState>) -> impl IntoResponse {

@@ -121,6 +121,7 @@ fn sql_list(items: &[String]) -> String {
     items.iter().map(|u| format!("'{}'", u.replace('\'', "''"))).collect::<Vec<_>>().join(",")
 }
 
+#[async_trait::async_trait]
 impl Connector for HosConnector {
     async fn probe(&self) -> anyhow::Result<ProbeInfo> {
         let mut client = self.connect().await?;

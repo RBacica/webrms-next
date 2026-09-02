@@ -89,6 +89,26 @@ async fn run() -> anyhow::Result<()> {
     let pool = webrms_next::db::init_pool(&data_dir).await?;
 
     let state = AppState::new(pool, cfg.clone(), data_dir);
+
+    // Start the connector poller when a live-system connection string is configured.
+    // Incremental pulls run on the poll interval (backstop); /api/sync/now forces a tick.
+    if !cfg.database.connection_string.is_empty() {
+        let conn = webrms_next::connector::hos::HosConnector::new(cfg.database.connection_string.clone());
+        let interval = std::time::Duration::from_secs(cfg.sync.poll_interval_minutes.max(1) * 60);
+        let handle = webrms_next::poller::Poller::new(
+            state.clone(),
+            Box::new(conn),
+            interval,
+            "new-hos".to_string(),
+        );
+        let poller_arc = handle.poller.clone();
+        if let Ok(mut p) = state.poller.write() { *p = Some(handle); }
+        tokio::spawn(async move { poller_arc.run().await });
+        tracing::info!("connector poller started (interval {}m)", cfg.sync.poll_interval_minutes);
+    } else {
+        tracing::info!("standalone mode — no connector configured");
+    }
+
     let app = webrms_next::build_app(state);
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
