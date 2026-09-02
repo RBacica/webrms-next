@@ -209,9 +209,16 @@ async fn seed_ordering_data(pool: &sqlx::SqlitePool) {
 }
 
 async fn seed_order_app() -> (axum::Router, tempfile::TempDir) {
+    seed_app_with(|pool| Box::pin(async move { seed_ordering_data(&pool).await })).await
+}
+
+/// Generic app seeder: fresh temp DB + HoS-mode config, then run `seed`.
+async fn seed_app_with(
+    seed: impl FnOnce(sqlx::SqlitePool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let pool = webrms_next::db::init_pool(tmp.path()).await.expect("pool");
-    seed_ordering_data(&pool).await;
+    seed(pool.clone()).await;
     let mut cfg = AppConfig::default();
     cfg.role.mode = "hos".into();
     let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
@@ -299,4 +306,93 @@ async fn ordering_confirmation_csv_shape() {
     let content = v["content"].as_str().unwrap();
     assert!(content.starts_with("Supplier,UPC,Description,Pack,OrderQty\n"), "csv: {content}");
     assert!(content.contains("010,5010677014205,Jameson 1L,6,6"), "csv: {content}");
+}
+
+// ── P2-3: payables — bills net of paid_ledger, returns, config, mark-paid ─────
+
+async fn seed_payables_data(pool: &sqlx::SqlitePool) {
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor'), (2, '013', '013', 'Hancocks')")
+        .execute(pool).await.unwrap();
+    // two unpaid invoices + one fully-paid (excluded)
+    sqlx::query(
+        "INSERT INTO ap_invoices (branch_id, supplier_id, invoice_number, description, invoice_date, invoice_amount, paid_amount, tax_amount1, logged) VALUES \
+         (2, 1, 'INV-100', 'goods-in', '2026-07-15', 1234.50, 0, 154.31, '2026-07-15T10:00:00'), \
+         (2, 2, 'INV-101', 'goods-in', '2026-07-16', 500.00, 0, 60.00, '2026-07-16T10:00:00'), \
+         (2, 1, 'INV-102', 'goods-in', '2026-07-17', 900.00, 900.00, 108.00, '2026-07-17T10:00:00')"
+    ).execute(pool).await.unwrap();
+    // one return 'Z' credit
+    sqlx::query(
+        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged) \
+         VALUES (2, 99, 1, 'Z', 1, 'CR-5', 200.00, '2026-07-18T09:00:00')"
+    ).execute(pool).await.unwrap();
+    // terms for 013: EOM+10 configured
+    sqlx::query("INSERT INTO supplier_terms (supplier_code, term_type, term_days, configured, source) VALUES ('013', 'EOM', 10, 1, 'app')")
+        .execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn payables_bills_net_of_paid_and_returns() {
+    let (app, _tmp) = seed_app_with(|pool| Box::pin(async move { seed_payables_data(&pool).await })).await;
+    let (status, body) = get(&app, "/api/payables/invoices?from=2026-07-01&to=2026-08-01&branch=2").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let arr = v.as_array().unwrap();
+    // INV-102 fully paid → excluded; INV-100/101 present
+    assert_eq!(arr.len(), 2, "body: {body}");
+    let inv100 = arr.iter().find(|i| i["invoice_number"] == "INV-100").unwrap();
+    assert_eq!(inv100["invoice_amount"].as_f64().unwrap(), 1234.50);
+    // 013 has EOM+10 configured → 2026-07-31 + 10 = 2026-08-10
+    let inv101 = arr.iter().find(|i| i["invoice_number"] == "INV-101").unwrap();
+    assert_eq!(inv101["due_date"], "2026-08-10");
+    assert_eq!(inv101["terms_unset"], false);
+    // 010 unconfigured → EOM+20 = 2026-08-20
+    assert_eq!(inv100["due_date"], "2026-08-20");
+    assert_eq!(inv100["terms_unset"], true);
+}
+
+#[tokio::test]
+async fn payables_returns_lists_credits() {
+    let (app, _tmp) = seed_app_with(|pool| Box::pin(async move { seed_payables_data(&pool).await })).await;
+    let (status, body) = get(&app, "/api/payables/returns?from=2026-07-01&to=2026-08-01").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["invoice_number"], "CR-5");
+    assert_eq!(arr[0]["invoice_amount"].as_f64().unwrap(), 200.00);
+}
+
+#[tokio::test]
+async fn payables_mark_paid_and_config() {
+    let (app, _tmp) = seed_app_with(|pool| Box::pin(async move { seed_payables_data(&pool).await })).await;
+    // mark INV-100 paid
+    let body = serde_json::json!({
+        "rows": [{"branch_id": 2, "supplier_code": "010", "invoice_number": "INV-100", "amount": 1234.50}]
+    });
+    let resp = app.clone().oneshot(
+        Request::builder().method("POST").uri("/api/payables/pay")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // bills now exclude INV-100 → only INV-101
+    let (_, body) = get(&app, "/api/payables/invoices?from=2026-07-01&to=2026-08-01&branch=2").await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1, "body: {body}");
+    assert_eq!(v.as_array().unwrap()[0]["invoice_number"], "INV-101");
+    // paid ledger lists it
+    let (_, body) = get(&app, "/api/payables/paid").await;
+    assert!(body.contains("INV-100"), "paid: {body}");
+    // config save (HoS mode) then read-back
+    let cfg_body = serde_json::json!({"supplier_code": "010", "term_type": "EOM", "term_days": 30, "order_type": "", "payment_type": ""});
+    let resp = app.clone().oneshot(
+        Request::builder().method("POST").uri("/api/payables/config")
+            .header("content-type", "application/json")
+            .body(Body::from(cfg_body.to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (_, body) = get(&app, "/api/payables/config").await;
+    assert!(body.contains("\"term_days\":30"), "config: {body}");
 }

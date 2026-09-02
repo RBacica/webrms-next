@@ -19,6 +19,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/sync/status", get(sync_status))
         .merge(crate::modules::stocktake::handlers::routes())
         .merge(crate::modules::ordering::handlers::routes())
+        .merge(crate::modules::payables::handlers::routes())
         .with_state(state)
 }
 
