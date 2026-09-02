@@ -144,9 +144,10 @@ pub struct LiveReceipt {
     pub invoice_no: Option<String>,
     pub total_cost: f64,
     pub logged: String,
-    /// SMHeaders.POID — the ETL PO reference (matches incoming_pos.poid for
-    /// app-generated POs) when the header carries one.
-    pub poid: Option<String>,
+    /// SMHeaders.BillOfLading — the 10-char ETL PO code (matches
+    /// incoming_pos.bill_of_lading for app-generated POs). The live SMHeaders
+    /// has no POID column; import is confirmed on this code.
+    pub bill_of_lading: Option<String>,
     /// SMHeaders.OriginatingTransNo — links a 'G' goods-in back to its 'P'.
     pub originating_trans_no: Option<i64>,
     pub lines: Vec<LiveReceiptLine>,

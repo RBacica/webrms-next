@@ -17,28 +17,32 @@ use sqlx::sqlite::SqlitePool;
 pub async fn auto_flip(pool: &SqlitePool) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
 
-    // 1. waiting_import → pending_receipt: a 'P' receipt carries our POID
+    // 1. waiting_import → pending_receipt: a 'P' receipt carries our
+    //    BillOfLading code (the ETL xlsx writes it; Infinity stores it on
+    //    SMHeaders.BillOfLading). Import IS confirmed → capture the Infinity
+    //    TransNo the PO became (transID) for the receipted link.
     let changed = sqlx::query(
-        "UPDATE incoming_pos SET status = 'pending_receipt', imported = 1, imported_at = datetime('now') \
+        "UPDATE incoming_pos SET status = 'pending_receipt', imported = 1, imported_at = datetime('now'), \
+                trans_no = (SELECT r.trans_no FROM receipts r \
+                            WHERE r.trans_type = 'P' AND r.branch_id = incoming_pos.branch_id \
+                              AND r.bill_of_lading = incoming_pos.bill_of_lading LIMIT 1) \
          WHERE status = 'waiting_import' AND EXISTS (\
              SELECT 1 FROM receipts r \
              WHERE r.trans_type = 'P' AND r.branch_id = incoming_pos.branch_id \
-               AND r.poid = incoming_pos.poid)",
+               AND r.bill_of_lading = incoming_pos.bill_of_lading)",
     )
     .execute(&mut *tx)
     .await?;
     let mut total = changed.rows_affected();
 
-    // 2. pending_receipt → receipted: a 'G' links back to that 'P' via
-    //    OriginatingTransNo
+    // 2. pending_receipt → receipted: the captured transID (Infinity TransNo)
+    //    is the OriginatingTransNo on a linked 'G' goods-in.
     let changed = sqlx::query(
         "UPDATE incoming_pos SET status = 'receipted', receipted_at = datetime('now') \
-         WHERE status = 'pending_receipt' AND EXISTS (\
-             SELECT 1 FROM receipts rp \
-             JOIN receipts rg ON rg.originating_trans_no = rp.trans_no \
-             WHERE rp.trans_type = 'P' AND rg.trans_type = 'G' \
-               AND rp.branch_id = incoming_pos.branch_id \
-               AND rp.poid = incoming_pos.poid)",
+         WHERE status = 'pending_receipt' AND trans_no IS NOT NULL AND EXISTS (\
+             SELECT 1 FROM receipts rg \
+             WHERE rg.trans_type = 'G' AND rg.branch_id = incoming_pos.branch_id \
+               AND rg.originating_trans_no = incoming_pos.trans_no)",
     )
     .execute(&mut *tx)
     .await?;
@@ -53,8 +57,8 @@ pub async fn auto_flip(pool: &SqlitePool) -> anyhow::Result<u64> {
 
 /// List incoming POs with resolved supplier names.
 pub async fn list(pool: &SqlitePool) -> anyhow::Result<Vec<serde_json::Value>> {
-    let rows: Vec<(i64, Option<String>, i64, String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT ip.branch_id, s.code, ip.poid, ip.filename, ip.status, ip.placed_at, ip.imported_at \
+    let rows: Vec<(i64, Option<String>, i64, String, String, String, Option<String>, Option<i64>)> = sqlx::query_as(
+        "SELECT ip.branch_id, s.code, ip.poid, ip.filename, ip.status, ip.placed_at, ip.imported_at, ip.trans_no \
          FROM incoming_pos ip LEFT JOIN suppliers s ON s.id = ip.supplier_id \
          ORDER BY ip.placed_at DESC",
     )
@@ -63,7 +67,7 @@ pub async fn list(pool: &SqlitePool) -> anyhow::Result<Vec<serde_json::Value>> {
     Ok(rows
         .into_iter()
         .map(
-            |(branch_id, supplier_code, poid, filename, status, placed_at, imported_at)| {
+            |(branch_id, supplier_code, poid, filename, status, placed_at, imported_at, trans_no)| {
                 serde_json::json!({
                     "branch_id": branch_id,
                     "supplier_code": supplier_code.unwrap_or_default(),
@@ -72,6 +76,7 @@ pub async fn list(pool: &SqlitePool) -> anyhow::Result<Vec<serde_json::Value>> {
                     "status": status,
                     "placed_at": placed_at,
                     "imported_at": imported_at,
+                    "trans_no": trans_no,
                 })
             },
         )

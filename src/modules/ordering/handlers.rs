@@ -210,6 +210,7 @@ async fn post_order(
             "order_id": order_id,
             "po_file": filename,
             "bill_of_lading": bol,
+            "poid": poid,
             "status": "waiting_import",
             "tracked_incoming": true,
         })),

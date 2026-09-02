@@ -178,16 +178,16 @@ pub async fn ingest_receipts<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C,
                 .bind(r.supplier.as_deref().unwrap_or("")).fetch_optional(&mut *tx).await?;
             let receipt_id: i64 = sqlx::query(
                 "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, \
-                        invoice_no, total_cost, logged, poid, originating_trans_no) \
+                        invoice_no, total_cost, logged, bill_of_lading, originating_trans_no) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
                  ON CONFLICT(branch_id, trans_no, station) DO UPDATE SET \
                    trans_type=excluded.trans_type, supplier_id=excluded.supplier_id, \
                    invoice_no=excluded.invoice_no, total_cost=excluded.total_cost, logged=excluded.logged, \
-                   poid=excluded.poid, originating_trans_no=excluded.originating_trans_no",
+                   bill_of_lading=excluded.bill_of_lading, originating_trans_no=excluded.originating_trans_no",
             )
             .bind(r.branch_id).bind(r.trans_no).bind(r.station).bind(&r.trans_type)
             .bind(supplier_id).bind(&r.invoice_no).bind(r.total_cost).bind(&r.logged)
-            .bind(&r.poid).bind(r.originating_trans_no)
+            .bind(&r.bill_of_lading).bind(r.originating_trans_no)
             .execute(&mut *tx).await?
             .last_insert_rowid();
             // replace detail lines (receipts are append-only in practice)

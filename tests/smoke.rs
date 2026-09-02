@@ -570,10 +570,10 @@ async fn incoming_po_auto_flip_lifecycle() {
     // seed_app_with calls init_pool(tmp.path()) → the DB is <tmp>/data.db
     let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
 
-    // stage 1: Infinity imports the PO → a 'P' receipt with our POID appears
+    // stage 1: Infinity imports the PO → a 'P' receipt with our BillOfLading appears
     sqlx::query(
-        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, poid) \
-         VALUES (2, 5000, 1, 'P', 1, 'P-5000', 1000.0, '2026-09-02 14:00:00', '123456')"
+        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading) \
+         VALUES (2, 5000, 1, 'P', 1, 'P-5000', 1000.0, '2026-09-02 14:00:00', 'ABC123')"
     ).execute(&pool).await.unwrap();
     let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
     assert_eq!(flipped, 1, "only our PO flips");
@@ -586,8 +586,8 @@ async fn incoming_po_auto_flip_lifecycle() {
 
     // stage 2: goods-in arrives, linked to the P via OriginatingTransNo
     sqlx::query(
-        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, poid, originating_trans_no) \
-         VALUES (2, 6000, 1, 'G', 1, 'G-6000', 1000.0, '2026-09-02 16:00:00', '123456', 5000)"
+        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading, originating_trans_no) \
+         VALUES (2, 6000, 1, 'G', 1, 'G-6000', 1000.0, '2026-09-02 16:00:00', 'ABC123', 5000)"
     ).execute(&pool).await.unwrap();
     let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
     assert_eq!(flipped, 1);
@@ -603,4 +603,84 @@ async fn incoming_po_auto_flip_lifecycle() {
     assert_eq!(ours["supplier_code"], "010");
     let foreign = list.iter().find(|p| p["poid"] == 999999).unwrap();
     assert_eq!(foreign["status"], "waiting_import");
+}
+
+// ── P2-8: full round-trip (W5) — order → ETL PO → waiting_import → 'P' import
+//         → pending_receipt → 'G' goods-in → receipted, all on the local DB ──
+
+async fn seed_roundtrip_data(pool: &sqlx::SqlitePool) {
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, upc, sku, description, department_id, supplier_id, cost, price1, pack_units, is_active) VALUES \
+         (1, '5010677014205', 'S1', 'Jameson 1L', NULL, 1, 40.0, 59.99, 6, 1)"
+    ).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO stock_current (branch_id, upc, qty, as_of) VALUES (2, '5010677014205', 12.0, '2026-09-02')")
+        .execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn w5_full_round_trip() {
+    let (app, tmp) = seed_app_with(|pool| Box::pin(async move { seed_roundtrip_data(&pool).await })).await;
+    // 1. post order via the API (creates order + ETL xlsx + incoming_pos row)
+    let body = serde_json::json!({
+        "supplier": "010", "branch": 2,
+        "by": "e2e",
+        "lines": [{"upc": "5010677014205", "qty": 12.0, "unit_cost": 40.0, "suggested_qty": 18.0}]
+    });
+    let resp = app.clone().oneshot(
+        Request::builder().method("POST").uri("/api/ordering/orders")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap()
+    ).await.unwrap();
+    let rb = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&rb).unwrap();
+    assert_eq!(v["status"], "waiting_import");
+    let poid = v["poid"].as_i64().unwrap();
+    let bol = v["bill_of_lading"].as_str().unwrap().to_string();
+    let order_id = v["order_id"].as_str().unwrap().to_string();
+
+    // order exists with status open
+    let (_, obody) = get(&app, "/api/ordering/orders?branch=2").await;
+    assert!(obody.contains("\"status\":\"open\""), "orders: {obody}");
+
+    // 2. ETL file exists in output/incoming-po/2/
+    let files: Vec<String> = std::fs::read_dir(tmp.path().join("output/incoming-po/2"))
+        .unwrap().map(|f| f.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert_eq!(files.len(), 1, "files: {files:?}");
+    assert!(files[0].ends_with(".xlsx"));
+
+    // 3. Infinity imports the PO → 'P' receipt with our BillOfLading appears
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading) \
+         VALUES (2, 7000, 1, 'P', 1, 'P-7000', 480.0, '2026-09-02 15:00:00', ?1)"
+    ).bind(&bol).execute(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    assert_eq!(flipped, 1);
+
+    // 4. goods-in → 'G' linked via OriginatingTransNo → receipted
+    sqlx::query(
+        "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading, originating_trans_no) \
+         VALUES (2, 7001, 1, 'G', 1, 'G-7001', 480.0, '2026-09-02 17:00:00', ?1, 7000)"
+    ).bind(&bol).execute(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    assert_eq!(flipped, 1);
+    let status: String = sqlx::query_scalar("SELECT status FROM incoming_pos WHERE bill_of_lading = ?1")
+        .bind(&bol).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, "receipted");
+
+    // 5. the linked order line qty now counts as on-order history but the
+    //    order itself stays open (cleared only via explicit clearing) — the
+    //    G-10 lifecycle: active_on_order includes the open order
+    let on_order = webrms_next::modules::ordering::orders::active_on_order(&pool, 2, "5010677014205").await.unwrap();
+    assert_eq!(on_order, 12.0, "open order line still on order");
+
+    // confirmation CSV works for the order
+    let (status, csv_body) = get(&app, &format!("/api/ordering/confirmation-csv?order_id={order_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let cv: serde_json::Value = serde_json::from_str(&csv_body).unwrap();
+    assert!(cv["content"].as_str().unwrap().contains("010,5010677014205,Jameson 1L,6,12"), "csv: {}", cv);
 }
