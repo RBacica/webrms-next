@@ -23,6 +23,7 @@ tiberius = { version = "0.12", features = ["tds73", "native-tls", "chrono"] }
 futures-util = "0.3.34"
 tokio-util = { version = "0.7.19", features = ["compat"] }
 async-trait = "0.1.92"
+rust_xlsxwriter = "0.98"
 # Windows service (SCM-native, headless --service mode). Windows-only; no-op elsewhere.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
