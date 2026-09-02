@@ -50,6 +50,7 @@ pub async fn active_on_order(pool: &SqlitePool, branch_id: i64, upc: &str) -> an
 /// Create an order + lines, generating the PO. Returns the order id.
 /// Status starts 'open'. The ETL file + incoming-PO tracking is the caller's
 /// job (handlers layer) — this is pure persistence.
+/// Emits outbox rows (orders + order_lines) so replication carries the order.
 pub async fn create_order(
     pool: &SqlitePool,
     origin_install: &str,
@@ -80,6 +81,7 @@ pub async fn create_order(
     .execute(&mut *tx)
     .await?;
 
+    let mut line_payloads = Vec::new();
     for (upc, qty, unit_cost, suggested) in lines {
         let line_id = Uuid::new_v4().to_string();
         sqlx::query(
@@ -95,18 +97,38 @@ pub async fn create_order(
         .bind(suggested)
         .execute(&mut *tx)
         .await?;
+        line_payloads.push(serde_json::json!({
+            "id": line_id, "order_id": id, "upc": upc, "qty": qty,
+            "unit_cost": unit_cost, "line_total": qty * unit_cost, "suggested_qty": suggested,
+        }));
     }
+
+    // outbox: order + lines (same tx — crash-safe replication)
+    let payload = serde_json::json!({
+        "id": id, "origin_install": origin_install, "branch_id": branch_id,
+        "supplier_id": supplier_id, "placed_at": placed_at, "status": "open",
+        "total_qty": total_qty, "total_cost": total_cost, "created_by": created_by,
+        "lines": line_payloads,
+    });
+    crate::replication::emit(&mut tx, origin_install, "orders", &id, "insert", &payload).await?;
+
     tx.commit().await?;
     Ok(id)
 }
 
 /// Mark an order cleared once its PO is fully receipted (P+G present).
-/// Removes it from active on-order (G-10).
-pub async fn clear_order(pool: &SqlitePool, order_id: &str) -> anyhow::Result<()> {
+/// Removes it from active on-order (G-10). Emits an outbox update.
+pub async fn clear_order(pool: &SqlitePool, order_id: &str, install: &str) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
     sqlx::query("UPDATE orders SET status = 'cleared', cleared_at = datetime('now') WHERE id = ?1")
         .bind(order_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    let payload = serde_json::json!({
+        "id": order_id, "status": "cleared", "cleared_at": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+    });
+    crate::replication::emit(&mut tx, install, "orders", order_id, "update", &payload).await?;
+    tx.commit().await?;
     Ok(())
 }
 

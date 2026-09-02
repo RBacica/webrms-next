@@ -105,7 +105,8 @@ impl Poller {
         }
         // incoming-PO lifecycle: flip waiting_import→pending_receipt→receipted
         // from the freshly pulled receipts (G-7)
-        if let Err(e) = crate::modules::incoming_po::auto_flip(pool).await {
+        let install = self.state.cfg.sync.install_name.clone();
+        if let Err(e) = crate::modules::incoming_po::auto_flip(pool, &install).await {
             tracing::warn!("poll: incoming-po auto-flip failed: {e}");
         }
         match ingest::ingest_ap(pool, c, src).await {

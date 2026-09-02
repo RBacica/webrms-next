@@ -11,10 +11,12 @@
 // The flip runs on every connector tick AFTER ingest_receipts, so it is
 // purely local and works in every mode.
 use sqlx::sqlite::SqlitePool;
+use sqlx::Row;
 
 /// Auto-flip incoming_pos statuses from the materialized receipts. Returns
-/// the number of rows whose status changed.
-pub async fn auto_flip(pool: &SqlitePool) -> anyhow::Result<u64> {
+/// the number of rows whose status changed. Emits outbox rows so the flip
+/// replicates to the ordering branch.
+pub async fn auto_flip(pool: &SqlitePool, install: &str) -> anyhow::Result<u64> {
     let mut tx = pool.begin().await?;
 
     // 1. waiting_import → pending_receipt: a 'P' receipt carries our
@@ -29,11 +31,17 @@ pub async fn auto_flip(pool: &SqlitePool) -> anyhow::Result<u64> {
          WHERE status = 'waiting_import' AND EXISTS (\
              SELECT 1 FROM receipts r \
              WHERE r.trans_type = 'P' AND r.branch_id = incoming_pos.branch_id \
-               AND r.bill_of_lading = incoming_pos.bill_of_lading)",
+               AND r.bill_of_lading = incoming_pos.bill_of_lading) \
+         RETURNING id, branch_id, supplier_id, filename, bill_of_lading, poid, status, imported, placed_at",
     )
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
-    let mut total = changed.rows_affected();
+    for row in &changed {
+        let id: String = row.get("id");
+        let payload = row_to_incoming_payload(row);
+        crate::replication::emit(&mut tx, install, "incoming_pos", &id, "update", &payload).await?;
+    }
+    let mut total = changed.len() as u64;
 
     // 2. pending_receipt → receipted: the captured transID (Infinity TransNo)
     //    is the OriginatingTransNo on a linked 'G' goods-in.
@@ -42,17 +50,38 @@ pub async fn auto_flip(pool: &SqlitePool) -> anyhow::Result<u64> {
          WHERE status = 'pending_receipt' AND trans_no IS NOT NULL AND EXISTS (\
              SELECT 1 FROM receipts rg \
              WHERE rg.trans_type = 'G' AND rg.branch_id = incoming_pos.branch_id \
-               AND rg.originating_trans_no = incoming_pos.trans_no)",
+               AND rg.originating_trans_no = incoming_pos.trans_no) \
+         RETURNING id, branch_id, supplier_id, filename, bill_of_lading, poid, status, imported, placed_at",
     )
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
-    total += changed.rows_affected();
+    for row in &changed {
+        let id: String = row.get("id");
+        let payload = row_to_incoming_payload(row);
+        crate::replication::emit(&mut tx, install, "incoming_pos", &id, "update", &payload).await?;
+    }
+    total += changed.len() as u64;
 
     tx.commit().await?;
     if total > 0 {
         tracing::info!("incoming-po: auto-flipped {total} row(s)");
     }
     Ok(total)
+}
+
+/// Build the incoming_pos outbox payload from a RETURNING row.
+fn row_to_incoming_payload(row: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.get::<String, _>("id"),
+        "branch_id": row.get::<i64, _>("branch_id"),
+        "supplier_id": row.get::<Option<i64>, _>("supplier_id"),
+        "filename": row.get::<String, _>("filename"),
+        "bill_of_lading": row.get::<Option<String>, _>("bill_of_lading"),
+        "poid": row.get::<Option<i64>, _>("poid"),
+        "status": row.get::<String, _>("status"),
+        "imported": row.get::<i64, _>("imported"),
+        "placed_at": row.get::<Option<String>, _>("placed_at"),
+    })
 }
 
 /// List incoming POs with resolved supplier names.

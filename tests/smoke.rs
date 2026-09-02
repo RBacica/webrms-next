@@ -575,7 +575,7 @@ async fn incoming_po_auto_flip_lifecycle() {
         "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading) \
          VALUES (2, 5000, 1, 'P', 1, 'P-5000', 1000.0, '2026-09-02 14:00:00', 'ABC123')"
     ).execute(&pool).await.unwrap();
-    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool, "local").await.unwrap();
     assert_eq!(flipped, 1, "only our PO flips");
     let status: String = sqlx::query_scalar("SELECT status FROM incoming_pos WHERE id = 'po-1'")
         .fetch_one(&pool).await.unwrap();
@@ -589,7 +589,7 @@ async fn incoming_po_auto_flip_lifecycle() {
         "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading, originating_trans_no) \
          VALUES (2, 6000, 1, 'G', 1, 'G-6000', 1000.0, '2026-09-02 16:00:00', 'ABC123', 5000)"
     ).execute(&pool).await.unwrap();
-    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool, "local").await.unwrap();
     assert_eq!(flipped, 1);
     let status: String = sqlx::query_scalar("SELECT status FROM incoming_pos WHERE id = 'po-1'")
         .fetch_one(&pool).await.unwrap();
@@ -658,7 +658,7 @@ async fn w5_full_round_trip() {
         "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading) \
          VALUES (2, 7000, 1, 'P', 1, 'P-7000', 480.0, '2026-09-02 15:00:00', ?1)"
     ).bind(&bol).execute(&pool).await.unwrap();
-    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool, "local").await.unwrap();
     assert_eq!(flipped, 1);
 
     // 4. goods-in → 'G' linked via OriginatingTransNo → receipted
@@ -666,7 +666,7 @@ async fn w5_full_round_trip() {
         "INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, invoice_no, total_cost, logged, bill_of_lading, originating_trans_no) \
          VALUES (2, 7001, 1, 'G', 1, 'G-7001', 480.0, '2026-09-02 17:00:00', ?1, 7000)"
     ).bind(&bol).execute(&pool).await.unwrap();
-    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool).await.unwrap();
+    let flipped = webrms_next::modules::incoming_po::auto_flip(&pool, "local").await.unwrap();
     assert_eq!(flipped, 1);
     let status: String = sqlx::query_scalar("SELECT status FROM incoming_pos WHERE bill_of_lading = ?1")
         .bind(&bol).fetch_one(&pool).await.unwrap();
@@ -683,4 +683,107 @@ async fn w5_full_round_trip() {
     assert_eq!(status, StatusCode::OK);
     let cv: serde_json::Value = serde_json::from_str(&csv_body).unwrap();
     assert!(cv["content"].as_str().unwrap().contains("010,5010677014205,Jameson 1L,6,12"), "csv: {}", cv);
+}
+
+// ── P3: replication — outbox push up (order/PO) + pull down (config) ─────────
+
+/// Spin up a real HTTP server on an ephemeral port, return (base_url, app).
+async fn serve_app(state: webrms_next::state::SharedState) -> (String, axum::Router) {
+    let app = webrms_next::build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app2).await.unwrap();
+    });
+    (format!("http://{addr}"), app)
+}
+
+#[tokio::test]
+async fn replication_order_up_config_down() {
+    // ── HoS (source) ──
+    let hos_tmp = tempfile::tempdir().unwrap();
+    let hos_pool = webrms_next::db::init_pool(hos_tmp.path()).await.unwrap();
+    let mut hos_cfg = AppConfig::default();
+    hos_cfg.role.mode = "hos".into();
+    hos_cfg.sync.install_name = "hos-1".into();
+    hos_cfg.sync.enabled = true;
+    let hos_state = AppState::new(hos_pool.clone(), hos_cfg, hos_tmp.path().to_path_buf());
+    let (hos_url, _hos_app) = serve_app(hos_state).await;
+    // seed both with the same reference rows (branches/suppliers)
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(&hos_pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(&hos_pool).await.unwrap();
+
+    // ── BoS (client) ──
+    let bos_tmp = tempfile::tempdir().unwrap();
+    let bos_pool = webrms_next::db::init_pool(bos_tmp.path()).await.unwrap();
+    let mut bos_cfg = AppConfig::default();
+    bos_cfg.role.mode = "bos".into();
+    bos_cfg.sync.install_name = "bos-2".into();
+    bos_cfg.sync.enabled = true;
+    bos_cfg.sync.source = hos_url.clone();
+    let bos_state = AppState::new(bos_pool.clone(), bos_cfg.clone(), bos_tmp.path().to_path_buf());
+    let bos_sync = bos_cfg.sync.clone();
+    let (_bos_url, _bos_app) = serve_app(bos_state).await;
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(&bos_pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(&bos_pool).await.unwrap();
+
+    // ── 1. BoS creates an order (branch 2) → outbox row on the BoS ──
+    let order_id = webrms_next::modules::ordering::orders::create_order(
+        &bos_pool, "bos-2", 2, Some(1), Some("tester"),
+        &[("5010677014205".into(), 12.0, 40.0, 18.0)],
+    ).await.unwrap();
+    let bo_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE origin_install = 'bos-2'")
+        .fetch_one(&bos_pool).await.unwrap();
+    assert_eq!(bo_count, 1, "order emitted one outbox row");
+
+    // ── 2. BoS pushes up → HoS applies it ──
+    let pushed = webrms_next::replication::push_once(&bos_pool, &bos_sync).await.unwrap();
+    assert_eq!(pushed, 1, "one row pushed up");
+    let hos_orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders").fetch_one(&hos_pool).await.unwrap();
+    assert_eq!(hos_orders, 1, "HoS has the BoS order");
+    let status: String = sqlx::query_scalar("SELECT status FROM orders WHERE id = ?1")
+        .bind(&order_id).fetch_one(&hos_pool).await.unwrap();
+    assert_eq!(status, "open");
+    // pushed row marked applied on the BoS (no retry loop)
+    let unapplied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE origin_install = 'bos-2' AND applied = 0")
+        .fetch_one(&bos_pool).await.unwrap();
+    assert_eq!(unapplied, 0);
+
+    // ── 3. HoS sets supplier terms (config) → BoS pulls down ──
+    sqlx::query(
+        "INSERT INTO supplier_terms (supplier_code, term_type, term_days, configured, source, updated_at) \
+         VALUES ('010', 'EOM', 30, 1, 'app', '2026-09-02')",
+    ).execute(&hos_pool).await.unwrap();
+    let payload = serde_json::json!({
+        "supplier_code": "010", "term_type": "EOM", "term_days": 30,
+        "order_type": "", "payment_type": "", "configured": 1, "source": "app",
+        "updated_at": "2026-09-02",
+    });
+    let mut tx = hos_pool.begin().await.unwrap();
+    webrms_next::replication::emit(&mut tx, "hos-1", "supplier_terms", "010", "insert", &payload).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let pulled = webrms_next::replication::pull_once(&bos_pool, &hos_sync(&hos_url), Some(2)).await.unwrap();
+    assert_eq!(pulled, 1, "BoS pulled the config row");
+    let terms: Option<i64> = sqlx::query_scalar("SELECT term_days FROM supplier_terms WHERE supplier_code = '010'")
+        .fetch_one(&bos_pool).await.unwrap();
+    assert_eq!(terms, Some(30), "terms propagated down");
+
+    // ── 4. echo prevention: BoS must NOT pull back its own order ──
+    let pulled2 = webrms_next::replication::pull_once(&bos_pool, &hos_sync(&hos_url), Some(2)).await.unwrap();
+    assert_eq!(pulled2, 0, "no echo of own rows; watermark advanced");
+}
+
+fn hos_sync(url: &str) -> webrms_next::config::SyncConfig {
+    webrms_next::config::SyncConfig {
+        enabled: true,
+        source: url.to_string(),
+        poll_interval_minutes: 1,
+        install_name: "bos-2".into(),
+    }
 }

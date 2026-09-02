@@ -247,28 +247,39 @@ pub async fn get_returns(
 }
 
 /// Mark rows paid → paid_ledger (app-owned; replicated via outbox DOWN).
-pub async fn mark_paid(pool: &SqlitePool, rows: &[PaidRow]) -> anyhow::Result<usize> {
+pub async fn mark_paid(pool: &SqlitePool, rows: &[PaidRow], install: &str) -> anyhow::Result<usize> {
     let mut added = 0usize;
     let mut tx = pool.begin().await?;
     for r in rows {
         if r.invoice_number.is_empty() {
             continue;
         }
+        let id = uuid::Uuid::new_v4().to_string();
+        let paid_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let res = sqlx::query(
             "INSERT OR IGNORE INTO paid_ledger (id, branch_id, supplier_code, invoice_no, paid_at, amount, note, origin_install) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&id)
         .bind(r.branch_id)
         .bind(&r.supplier_code)
         .bind(&r.invoice_number)
-        .bind(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
+        .bind(&paid_at)
         .bind(r.amount)
         .bind(r.note.as_deref().unwrap_or(""))
-        .bind("local")
+        .bind(install)
         .execute(&mut *tx)
         .await?;
-        added += res.rows_affected() as usize;
+        let inserted = res.rows_affected() > 0;
+        if inserted {
+            added += 1;
+            let payload = serde_json::json!({
+                "id": id, "branch_id": r.branch_id, "supplier_code": r.supplier_code,
+                "invoice_no": r.invoice_number, "paid_at": paid_at, "amount": r.amount,
+                "note": r.note, "origin_install": install,
+            });
+            crate::replication::emit(&mut tx, install, "paid_ledger", &id, "insert", &payload).await?;
+        }
     }
     tx.commit().await?;
     Ok(added)
@@ -345,7 +356,10 @@ pub async fn save_one(
     term_days: Option<i64>,
     order_type: &str,
     payment_type: &str,
+    install: &str,
 ) -> anyhow::Result<()> {
+    let updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO supplier_terms (supplier_code, term_type, term_days, order_type, payment_type, configured, source, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, 1, 'app', ?6) \
@@ -359,8 +373,15 @@ pub async fn save_one(
     .bind(term_days)
     .bind(order_type)
     .bind(payment_type)
-    .bind(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())
-    .execute(pool)
+    .bind(&updated_at)
+    .execute(&mut *tx)
     .await?;
+    let payload = serde_json::json!({
+        "supplier_code": supplier_code, "term_type": term_type, "term_days": term_days,
+        "order_type": order_type, "payment_type": payment_type, "configured": 1,
+        "source": "app", "updated_at": updated_at,
+    });
+    crate::replication::emit(&mut tx, install, "supplier_terms", supplier_code, "insert", &payload).await?;
+    tx.commit().await?;
     Ok(())
 }

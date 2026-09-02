@@ -109,6 +109,19 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!("standalone mode — no connector configured");
     }
 
+    // P3 replication: client installs (BoS / Remote-HoS) pull config + orders
+    // down from the HoS and push their own rows up. HoS = source (serves
+    // /api/sync/outbox + /api/sync/up), never a client.
+    if cfg.sync.enabled && !cfg.sync.source.is_empty() && cfg.role.mode != "hos" {
+        let repl_state = state.clone();
+        tokio::spawn(async move {
+            tracing::info!("replication client started → {}", repl_state.cfg.sync.source);
+            webrms_next::replication::run_loop(repl_state).await;
+        });
+    } else if cfg.role.mode == "hos" {
+        tracing::info!("replication: HoS is the sync source (serving outbox)");
+    }
+
     let app = webrms_next::build_app(state);
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);

@@ -145,10 +145,14 @@ async fn save_config(
         body.term_days,
         &body.order_type,
         &body.payment_type,
+        &state.cfg.sync.install_name,
     )
     .await
     {
-        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
+        Ok(()) => {
+            crate::replication::notify_write(&state);
+            (StatusCode::OK, Json(json!({ "status": "ok" })))
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Failed to save config: {e}") })),
@@ -181,13 +185,14 @@ async fn save_config_bulk(
         let term_days = s["term_days"].as_i64();
         let order_type = s["order_type"].as_str().unwrap_or("").to_string();
         let payment_type = s["payment_type"].as_str().unwrap_or("").to_string();
-        if db::save_one(&state.pool, &code, &term_type, term_days, &order_type, &payment_type)
+        if db::save_one(&state.pool, &code, &term_type, term_days, &order_type, &payment_type, &state.cfg.sync.install_name)
             .await
             .is_ok()
         {
             ok += 1;
         }
     }
+    crate::replication::notify_write(&state);
     (StatusCode::OK, Json(json!({ "status": "ok", "saved": ok })))
 }
 
@@ -227,11 +232,14 @@ async fn mark_paid(
             Json(json!({ "status": "error", "message": "No invoices selected to mark as paid" })),
         );
     }
-    match db::mark_paid(&state.pool, &rows).await {
-        Ok(added) => (
-            StatusCode::OK,
-            Json(json!({ "status": "ok", "message": format!("Marked {added} invoice(s) as paid"), "rows": added })),
-        ),
+    match db::mark_paid(&state.pool, &rows, &state.cfg.sync.install_name).await {
+        Ok(added) => {
+            crate::replication::notify_write(&state);
+            (
+                StatusCode::OK,
+                Json(json!({ "status": "ok", "message": format!("Marked {added} invoice(s) as paid"), "rows": added })),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "status": "error", "message": format!("Failed to mark paid: {e}") })),

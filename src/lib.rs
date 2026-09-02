@@ -5,6 +5,7 @@ pub mod files;
 pub mod ingest;
 pub mod modules;
 pub mod poller;
+pub mod replication;
 pub mod server;
 pub mod state;
 pub mod util;

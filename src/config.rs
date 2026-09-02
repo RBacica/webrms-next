@@ -43,7 +43,12 @@ pub struct SyncConfig {
     pub source: String,
     #[serde(default = "default_poll")]
     pub poll_interval_minutes: u64,
+    /// This install's identity (outbox origin_install + sync auth label).
+    #[serde(default = "default_install")]
+    pub install_name: String,
 }
+
+fn default_install() -> String { "local".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleConfig {

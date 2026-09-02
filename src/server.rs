@@ -7,6 +7,7 @@ use serde_json::json;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::db;
+use crate::replication;
 use crate::state::{ServerInfo, ServerMode, SharedState};
 
 /// Build the axum router with all registered routes + the static web UI.
@@ -23,6 +24,8 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/version", get(version))
         .route("/api/sync/now", post(sync_now))
         .route("/api/sync/status", get(sync_status))
+        .route("/api/sync/outbox", get(replication::outbox_route))
+        .route("/api/sync/up", post(replication::sync_up_route))
         .merge(crate::modules::stocktake::handlers::routes())
         .merge(crate::modules::ordering::handlers::routes())
         .merge(crate::modules::payables::handlers::routes())

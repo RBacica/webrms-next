@@ -182,19 +182,26 @@ async fn post_order(
         );
     }
     let placed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let install = state.cfg.sync.install_name.clone();
+    let incoming_id = uuid::Uuid::new_v4().to_string();
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to begin tx: {e}") }))),
+    };
     if let Err(e) = sqlx::query(
         "INSERT INTO incoming_pos (id, origin_install, branch_id, supplier_id, filename, \
                 bill_of_lading, poid, status, imported, placed_at) \
-         VALUES (?1, 'local', ?2, ?3, ?4, ?5, ?6, 'waiting_import', 0, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'waiting_import', 0, ?8)",
     )
-    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&incoming_id)
+    .bind(&install)
     .bind(branch)
     .bind(sup_id)
     .bind(&filename)
     .bind(&bol)
     .bind(poid)
     .bind(&placed_at)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     {
         return (
@@ -202,6 +209,25 @@ async fn post_order(
             Json(json!({ "error": format!("Failed to record incoming PO: {e}") })),
         );
     }
+    // outbox: replicate the incoming PO up to the HoS
+    let payload = serde_json::json!({
+        "id": incoming_id, "origin_install": install, "branch_id": branch,
+        "supplier_id": sup_id, "filename": filename, "bill_of_lading": bol,
+        "poid": poid, "status": "waiting_import", "imported": 0, "placed_at": placed_at,
+    });
+    if let Err(e) = crate::replication::emit(&mut tx, &install, "incoming_pos", &incoming_id, "insert", &payload).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to emit outbox: {e}") })),
+        );
+    }
+    if let Err(e) = tx.commit().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to commit: {e}") })),
+        );
+    }
+    crate::replication::notify_write(&state);
 
     (
         StatusCode::OK,
