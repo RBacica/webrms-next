@@ -26,6 +26,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/sync/status", get(sync_status))
         .route("/api/sync/outbox", get(replication::outbox_route))
         .route("/api/sync/up", post(replication::sync_up_route))
+        .route("/api/sync/snapshot", get(sync_snapshot))
         .merge(crate::modules::stocktake::handlers::routes())
         .merge(crate::modules::ordering::handlers::routes())
         .merge(crate::modules::payables::handlers::routes())
@@ -112,6 +113,43 @@ async fn sync_now(State(state): State<SharedState>) -> impl IntoResponse {
         None => (
             StatusCode::CONFLICT,
             Json(json!({ "ok": false, "error": "connector not configured (standalone mode)" })),
+        ),
+    }
+}
+
+/// GET /api/sync/snapshot — stream the HoS's gzip'd DB snapshot (O-5).
+async fn sync_snapshot(State(state): State<SharedState>) -> impl IntoResponse {
+    let key = state.cfg.sync.snapshot_key.clone();
+    let data_dir = state.data_dir.clone();
+    let pool = state.pool.clone();
+    match crate::snapshot::build_snapshot(&pool, &data_dir, &key).await {
+        Ok((path, sig)) => match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                let mut headers = axum::http::HeaderMap::new();
+                if !sig.is_empty() {
+                    if let Ok(v) = axum::http::HeaderValue::from_str(&sig) {
+                        headers.insert(crate::snapshot::SIG_HEADER, v);
+                    }
+                }
+                if let Ok(v) = axum::http::HeaderValue::from_str("application/gzip") {
+                    headers.insert(axum::http::header::CONTENT_TYPE, v);
+                }
+                (
+                    StatusCode::OK,
+                    headers,
+                    axum::body::Body::from(bytes),
+                )
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::http::HeaderMap::new(),
+                axum::body::Body::from(format!("{{ \"error\": \"read snapshot: {e}\" }}")),
+            ),
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::HeaderMap::new(),
+            axum::body::Body::from(format!("{{ \"error\": \"build snapshot: {e}\" }}")),
         ),
     }
 }

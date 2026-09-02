@@ -638,7 +638,6 @@ async fn w5_full_round_trip() {
     let rb = resp.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&rb).unwrap();
     assert_eq!(v["status"], "waiting_import");
-    let poid = v["poid"].as_i64().unwrap();
     let bol = v["bill_of_lading"].as_str().unwrap().to_string();
     let order_id = v["order_id"].as_str().unwrap().to_string();
 
@@ -785,5 +784,46 @@ fn hos_sync(url: &str) -> webrms_next::config::SyncConfig {
         source: url.to_string(),
         poll_interval_minutes: 1,
         install_name: "bos-2".into(),
+        snapshot_key: String::new(),
     }
+}
+
+// ── P3: snapshot fallback (O-5) — signed gzip restore round-trip ────────────
+
+#[tokio::test]
+async fn snapshot_signed_restore_round_trip() {
+    // HoS with a signing key
+    let hos_tmp = tempfile::tempdir().unwrap();
+    let hos_pool = webrms_next::db::init_pool(hos_tmp.path()).await.unwrap();
+    let mut hos_cfg = AppConfig::default();
+    hos_cfg.role.mode = "hos".into();
+    hos_cfg.sync.snapshot_key = "test-key-123".into();
+    let hos_state = AppState::new(hos_pool.clone(), hos_cfg, hos_tmp.path().to_path_buf());
+    let (hos_url, _app) = serve_app(hos_state).await;
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1)")
+        .execute(&hos_pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(&hos_pool).await.unwrap();
+    sqlx::query("INSERT INTO items (id, upc, sku, description, cost, price1, is_active) VALUES (1, '5010677014205', 'S1', 'Jameson', 40.0, 59.99, 1)")
+        .execute(&hos_pool).await.unwrap();
+
+    // client restores the signed snapshot into a fresh data dir
+    let client_dir = tempfile::tempdir().unwrap();
+    let db_path = client_dir.path().join("data.db");
+    let restored = webrms_next::snapshot::restore_snapshot(&hos_url, "test-key-123", &db_path).await.unwrap();
+    assert!(restored > 0, "downloaded gz bytes");
+
+    // wrong key must refuse
+    let wrong = webrms_next::snapshot::restore_snapshot(&hos_url, "wrong-key", &db_path).await;
+    assert!(wrong.is_err(), "HMAC mismatch must refuse restore");
+
+    // open the restored DB and verify content
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&db_path)
+        .create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&pool).await.unwrap();
+    assert_eq!(items, 1);
+    let suppliers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suppliers").fetch_one(&pool).await.unwrap();
+    assert_eq!(suppliers, 1);
 }

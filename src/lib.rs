@@ -7,6 +7,7 @@ pub mod modules;
 pub mod poller;
 pub mod replication;
 pub mod server;
+pub mod snapshot;
 pub mod state;
 pub mod util;
 use axum::Router;

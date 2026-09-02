@@ -46,6 +46,9 @@ pub struct SyncConfig {
     /// This install's identity (outbox origin_install + sync auth label).
     #[serde(default = "default_install")]
     pub install_name: String,
+    /// HMAC key for snapshot signing (O-5). Empty = unsigned dev mode.
+    #[serde(default)]
+    pub snapshot_key: String,
 }
 
 fn default_install() -> String { "local".into() }
