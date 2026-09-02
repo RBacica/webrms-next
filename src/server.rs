@@ -4,12 +4,18 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::db;
 use crate::state::{ServerInfo, ServerMode, SharedState};
 
-/// Build the axum router with all registered routes.
+/// Build the axum router with all registered routes + the static web UI.
 pub fn build_router(state: SharedState) -> Router {
+    // Static UI: web/ served from the working directory (same layout as the
+    // old WebRMS — run-* dirs bundle web/ next to the binary). SPA fallback
+    // for / and any non-API path.
+    let assets = ServeDir::new("web").not_found_service(ServeFile::new("web/index.html"));
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/mode", get(mode))
@@ -22,6 +28,7 @@ pub fn build_router(state: SharedState) -> Router {
         .merge(crate::modules::payables::handlers::routes())
         .merge(crate::modules::promotions::handlers::routes())
         .merge(crate::modules::reports::handlers::routes())
+        .fallback_service(assets)
         .with_state(state)
 }
 
