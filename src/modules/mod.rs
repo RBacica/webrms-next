@@ -2,4 +2,5 @@
 pub mod ordering;
 pub mod payables;
 pub mod promotions;
+pub mod reports;
 pub mod stocktake;

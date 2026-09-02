@@ -473,3 +473,74 @@ async fn promotions_list_and_effectiveness() {
     assert_eq!(s["base_units"].as_f64().unwrap(), 16.0, "body: {body}");
     assert!((s["uplift_units"].as_f64().unwrap() - 2.0).abs() < 1e-9);
 }
+
+// ── P2-5: reports — daily/depts/overview/movers/dept-weekly over sales_daily ─
+
+async fn seed_report_data(pool: &sqlx::SqlitePool) {
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO departments (id, ext_key, name, target_margin) VALUES (60, 60, 'Spirits', 25), (70, 70, 'Wine', 30)")
+        .execute(pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, upc, sku, description, department_id, cost, price1, is_active) VALUES \
+         (1, '5010677014205', 'S1', 'Jameson 1L', 60, 40.0, 59.99, 1), \
+         (2, '5010677025812', 'S2', 'Bacardi 1L', 60, 36.0, 52.99, 1), \
+         (3, '9311043093661', 'W1', 'Banrock Moscato', 70, 8.0, 15.99, 1)"
+    ).execute(pool).await.unwrap();
+    // 10 days: Jameson 10/day, Bacardi 5/day, Banrock 3/day
+    let today = chrono::Local::now().date_naive();
+    let mut tx = pool.begin().await.unwrap();
+    for d in 0..10 {
+        let date = (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+        for (upc, units, cost) in [("5010677014205", 10.0, 40.0), ("5010677025812", 5.0, 36.0), ("9311043093661", 3.0, 8.0)] {
+            let price = if upc == "5010677014205" { 59.99 } else if upc == "5010677025812" { 52.99 } else { 15.99 };
+            let revenue = units * price;
+            sqlx::query(
+                "INSERT INTO sales_daily (branch_id, upc, sale_date, units, revenue, promo_units, normal_units, cost_amount, line_margin) \
+                 VALUES (2, ?1, ?2, ?3, ?4, 0, ?3, ?5, ?6)",
+            ).bind(upc).bind(&date).bind(units).bind(revenue).bind(units * cost).bind(revenue - units * cost)
+             .execute(&mut *tx).await.unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    sqlx::query("INSERT INTO stock_current (branch_id, upc, qty, as_of) VALUES (2, '5010677014205', 50.0, '2026-09-02'), (2, '5010677025812', 20.0, '2026-09-02'), (2, '9311043093661', 0.0, '2026-09-02')")
+        .execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn reports_overview_and_depts() {
+    let (app, _tmp) = seed_app_with(|pool| Box::pin(async move { seed_report_data(&pool).await })).await;
+    let today = chrono::Local::now().date_naive();
+    let from = (today - chrono::Duration::days(15)).format("%Y-%m-%d").to_string();
+    let to = (today + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+
+    // overview
+    let (status, body) = get(&app, "/api/reports/overview?branch=2").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["sales"]["today"].as_f64().unwrap() > 0.0, "body: {body}");
+    assert!(v["stock"]["items"].as_i64().unwrap() >= 3, "body: {body}");
+    // stockout: Banrock qty 0
+    assert!(v["stock"]["stockout"].as_i64().unwrap() >= 1, "body: {body}");
+
+    // depts: 2 depts, Spirits has 2 products
+    let (status, body) = get(&app, &format!("/api/reports/depts?from={from}&to={to}&branch=2")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2, "body: {body}");
+    let spirits = v.as_array().unwrap().iter().find(|d| d["dept_name"] == "Spirits").unwrap();
+    assert_eq!(spirits["products"].as_array().unwrap().len(), 2, "body: {body}");
+
+    // movers: Jameson top by net
+    let (status, body) = get(&app, &format!("/api/reports/overview/movers?from={from}&to={to}&branch=2&limit=5")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v.as_array().unwrap()[0]["upc"], "5010677014205", "body: {body}");
+
+    // dept-weekly: includes Total row
+    let (status, body) = get(&app, "/api/reports/overview/dept-weekly?branch=2").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v.as_array().unwrap().iter().any(|d| d["dept_name"] == "Total"), "body: {body}");
+    assert!(v.as_array().unwrap()[0]["this_week_gross"].as_f64().unwrap() > 0.0, "body: {body}");
+}
