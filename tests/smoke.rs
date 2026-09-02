@@ -176,3 +176,127 @@ async fn stocktake_export_server_writes_count_and_ticket() {
     assert!(qry.contains("CriteriaCount=1"), "qry: {qry}");
     assert!(qry.contains("CopiesException=2"), "qry: {qry}");
 }
+
+// ── P2-2: ordering module — sheet + post + ETL + incoming-PO (W5) ─────────────
+
+async fn seed_ordering_data(pool: &sqlx::SqlitePool) {
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO departments (id, ext_key, name) VALUES (60, 60, 'Spirits')")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, upc, sku, description, department_id, supplier_id, cost, price1, pack_units, min_qty, max_qty, no_order, is_active) VALUES \
+         (1, '5010677014205', 'S1', 'Jameson 1L', 60, 1, 40.0, 59.99, 6, 0, 0, 0, 1), \
+         (2, '5010677025812', 'S2', 'Bacardi 1L', 60, 1, 36.0, 52.99, 12, 0, 0, 0, 1)"
+    ).execute(pool).await.unwrap();
+    // 30 days of sales @ 4/day for item 1, none for item 2 (no_history)
+    let today = chrono::Local::now().date_naive();
+    let mut tx = pool.begin().await.unwrap();
+    for d in 0..30 {
+        let date = (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+        sqlx::query(
+            "INSERT INTO sales_daily (branch_id, upc, sale_date, units, revenue, promo_units, normal_units, cost_amount, line_margin) \
+             VALUES (2, '5010677014205', ?1, 4.0, 239.96, 0, 4, 160.0, 79.96)",
+        ).bind(&date).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    sqlx::query("INSERT INTO stock_current (branch_id, upc, qty, as_of) VALUES (2, '5010677014205', 12.0, '2026-09-02'), (2, '5010677025812', 4.0, '2026-09-02')")
+        .execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO supplier_modes (supplier_code, mode, lead_days, cycle_days, source) VALUES ('010', 'weekly', 3, 7, 'connector')")
+        .execute(pool).await.unwrap();
+}
+
+async fn seed_order_app() -> (axum::Router, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pool = webrms_next::db::init_pool(tmp.path()).await.expect("pool");
+    seed_ordering_data(&pool).await;
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "hos".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    (webrms_next::build_app(state), tmp)
+}
+
+#[tokio::test]
+async fn ordering_sheet_forecasts_suggested_qty() {
+    let (app, _tmp) = seed_order_app().await;
+    let (status, body) = get(&app, "/api/ordering/sheet?supplier=010&branch=2").await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let lines = v["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 2, "body: {body}");
+    // Jameson: 30d @4/day → has history → suggested > 0
+    let jameson = lines.iter().find(|l| l["upc"] == "5010677014205").unwrap();
+    assert_eq!(jameson["result"]["no_history"], false);
+    assert!(jameson["result"]["suggested"].as_f64().unwrap() > 0.0, "suggested should be >0");
+    // Bacardi: no history → never auto-suggest
+    let bacardi = lines.iter().find(|l| l["upc"] == "5010677025812").unwrap();
+    assert_eq!(bacardi["result"]["no_history"], true, "body: {body}");
+    assert_eq!(bacardi["result"]["suggested"].as_f64().unwrap(), 0.0);
+}
+
+#[tokio::test]
+async fn ordering_post_writes_etl_and_incoming_po() {
+    let (app, _tmp) = seed_order_app().await;
+    let body = serde_json::json!({
+        "supplier": "010",
+        "branch": 2,
+        "by": "tester",
+        "lines": [
+            {"upc": "5010677014205", "qty": 12.0, "unit_cost": 40.0, "suggested_qty": 18.0}
+        ]
+    });
+    let resp = app.clone().oneshot(
+        Request::builder().method("POST").uri("/api/ordering/orders")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap()
+    ).await.unwrap();
+    let status = resp.status();
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let resp_body = String::from_utf8_lossy(&resp_body).to_string();
+    assert_eq!(status, StatusCode::OK, "body: {resp_body}");
+    let v: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
+    assert_eq!(v["status"], "waiting_import");
+    assert!(v["po_file"].as_str().unwrap().ends_with(".xlsx"));
+    let bol = v["bill_of_lading"].as_str().unwrap();
+    assert_eq!(bol.len(), 10, "bol: {bol}");
+    // order recorded
+    let (status, list) = get(&app, "/api/ordering/orders?branch=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list.contains("\"status\":\"open\""), "orders: {list}");
+    // incoming-PO tracked
+    let (status, inc) = get(&app, "/api/sync/incoming-po").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(inc.contains("PurchaseOrder-010-2-"), "incoming: {inc}");
+    // ETL file exists on disk under output/incoming-po/2/
+    let files = std::fs::read_dir(_tmp.path().join("output/incoming-po/2")).unwrap();
+    let names: Vec<String> = files.map(|f| f.unwrap().file_name().to_string_lossy().to_string()).collect();
+    assert_eq!(names.len(), 1, "files: {names:?}");
+    assert!(names[0].ends_with(".xlsx"));
+}
+
+#[tokio::test]
+async fn ordering_confirmation_csv_shape() {
+    let (app, _tmp) = seed_order_app().await;
+    // post first to get an order id
+    let body = serde_json::json!({
+        "supplier": "010", "branch": 2,
+        "lines": [{"upc": "5010677014205", "qty": 6.0, "unit_cost": 40.0}]
+    });
+    let resp = app.clone().oneshot(
+        Request::builder().method("POST").uri("/api/ordering/orders")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap()
+    ).await.unwrap();
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    let order_id = v["order_id"].as_str().unwrap();
+    // confirmation CSV
+    let (status, csv_resp) = get(&app, &format!("/api/ordering/confirmation-csv?order_id={order_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&csv_resp).unwrap();
+    let content = v["content"].as_str().unwrap();
+    assert!(content.starts_with("Supplier,UPC,Description,Pack,OrderQty\n"), "csv: {content}");
+    assert!(content.contains("010,5010677014205,Jameson 1L,6,6"), "csv: {content}");
+}

@@ -290,7 +290,7 @@ impl Connector for HosConnector {
         let mut client = self.connect().await?;
         let since: i64 = hw.last_key.as_deref().unwrap_or("0").parse().unwrap_or(0);
         let sql = format!(
-            "SELECT TOP {limit} mv.ID, CAST(mv.Branch AS INT), mv.UPC, CAST(mv.Quantity AS FLOAT), \
+            "SELECT TOP {limit} mv.ID, CAST(mv.Branch AS INT), mv.UPC, CAST(tl.Quantity AS FLOAT), \
                     CAST(tl.Price AS FLOAT), CAST(tl.Cost AS FLOAT), tl.LineType, CONVERT(varchar(10), th.Logged, 120) \
              FROM ItemMovement mv \
              JOIN TransLines tl ON tl.UPC = mv.UPC AND tl.TransNo = mv.TransNo \

@@ -35,7 +35,7 @@ pub struct Order {
 /// on the way / in the back room) — cleared means fully received & verified.
 pub async fn active_on_order(pool: &SqlitePool, branch_id: i64, upc: &str) -> anyhow::Result<f64> {
     let qty: Option<f64> = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(ol.qty), 0) \
+        "SELECT CAST(COALESCE(SUM(ol.qty), 0) AS REAL) \
          FROM order_lines ol \
          JOIN orders o ON o.id = ol.order_id \
          WHERE o.branch_id = ?1 AND ol.upc = ?2 AND o.status != 'cleared'",

@@ -38,7 +38,7 @@ pub struct LineInput {
     pub ignore_max_qty: bool, // skip Items.MaxQty cap
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LineResult {
     pub rate30: f64,
     pub rate90: f64,
