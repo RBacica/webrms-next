@@ -126,7 +126,7 @@ async fn post_order(
         .collect();
     let order_id = match orders::create_order(
         &state.pool,
-        "local",
+        &state.cfg.sync.install_name,
         branch,
         sup_id,
         body.by.as_deref(),

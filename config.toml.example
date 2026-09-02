@@ -24,3 +24,5 @@ connection_string = ""
 enabled = false
 source = ""            # HoS WebRMS-Next address, e.g. http://100.71.113.111:8080
 poll_interval_minutes = 15
+# Unique identity for this install (outbox origin_install + sync routing).
+install_name = "local"

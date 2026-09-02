@@ -299,6 +299,29 @@ pub async fn sync_up_route(
                 let _ = sqlx::query("UPDATE outbox SET applied = 1 WHERE id = ?1 AND origin_install = ?2")
                     .bind(r["id"].as_str().unwrap_or("")).bind(install)
                     .execute(&state.pool).await;
+                // CONFIG-DOWN relay: re-emit into OUR outbox so every other
+                // client pulls it down too (a Remote-HoS write must fan out to
+                // all branches via the HoS). Branch-scoped rows (orders/POs)
+                // are NOT re-emitted — the HoS aggregates them, and each
+                // branch only pulls its own.
+                if table_allowed_for(table) && CONFIG_DOWN.contains(&table) {
+                    let relay_payload = payload.clone();
+                    let relay_table = table.to_string();
+                    let relay_row_id = row_id.to_string();
+                    let relay_install = state.cfg.sync.install_name.clone();
+                    let mut tx = match state.pool.begin().await {
+                        Ok(tx) => tx,
+                        Err(e) => { errors.push(format!("relay tx: {e}")); continue; }
+                    };
+                    match emit(&mut tx, &relay_install, &relay_table, &relay_row_id, "insert", &relay_payload).await {
+                        Ok(()) => {
+                            if let Err(e) = tx.commit().await {
+                                errors.push(format!("relay commit: {e}"));
+                            }
+                        }
+                        Err(e) => errors.push(format!("relay emit: {e}")),
+                    }
+                }
             }
             Err(e) => errors.push(format!("{table}/{row_id}: {e}")),
         }
