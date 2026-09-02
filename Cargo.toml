@@ -1,0 +1,34 @@
+[package]
+name = "webrms-next"
+version = "0.1.0"
+edition = "2021"
+description = "WebRMS-Next — self-contained retail platform with live-system ingestion & replication"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+# Windows service (SCM-native, headless --service mode). Windows-only; no-op elsewhere.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

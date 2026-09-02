@@ -1,0 +1,26 @@
+# WebRMS-Next — example configuration
+# Copy to `config.toml` next to the executable, then edit.
+
+[server]
+# 0.0.0.0 so other devices on the LAN/Tailscale can reach this instance.
+host = "0.0.0.0"
+port = 8080
+
+[paths]
+# Where the app keeps its SQLite DB + generated exports. Relative to the exe.
+data_dir = "data"
+
+[role]
+# hos | bos | remote-hos
+mode = "hos"
+
+[database]
+# Connector connection string (tiberius key=value) to a live AKPOS SQL Server.
+# Empty = standalone (no live system). Filled in at P1.
+connection_string = ""
+
+[sync]
+# Replication: enabled on clients (bos / remote-hos), disabled on the HoS.
+enabled = false
+source = ""            # HoS WebRMS-Next address, e.g. http://100.71.113.111:8080
+poll_interval_minutes = 15
