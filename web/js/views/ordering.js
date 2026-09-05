@@ -15,6 +15,7 @@ export async function render(el, { API, SERVER }) {
       <button id="od-all" class="toggle-btn">Show all lines</button>
       <button id="od-load" class="secondary">Load sheet</button>
       <button id="od-settings" class="secondary" title="Ordering settings (modes + global switches)">⚙ Settings</button>
+      <button id="od-repl" class="secondary" title="Inactive same-description predecessors (W6)">Replacement report</button>
       <div class="btn-group" id="od-post-group" style="display:none">
         <button id="od-post">Post order → ETL</button>
         <button id="od-csv" class="secondary" title="Download supplier confirmation CSV">CSV</button>
@@ -78,6 +79,28 @@ export async function render(el, { API, SERVER }) {
         } catch (e) { msg(e.message, "error"); }
       };
     } catch (e) { panel.innerHTML = `<p class="bad">${e.message}</p>`; }
+  };
+
+  // ── replacement report (W6 predecessor scan) ──────────────────────────────
+  $("od-repl").onclick = async () => {
+    msg("Loading replacement report…");
+    try {
+      const d = await API.get("/api/ordering/replacement-report");
+      const rows = d.rows || [];
+      const lvl = (v) => v === 3 ? "OLD_ sku" : v === 2 ? "same prod code" : v === 1 ? "same supplier" : "unmatched";
+      $("od-results").innerHTML = rows.length
+        ? `<div class="panel"><h3>Replacement report — inactive predecessors of active items <span class="muted">(${rows.length})</span></h3>
+        <div class="table-wrap"><table>
+        <thead><tr><th>Active item</th><th>Inactive predecessor</th><th>Old SKU</th><th>Match</th><th>Suggested OLD_ SKU</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr>
+          <td>${esc(r.description)}<div class="muted">${esc(r.new_upc)} · sup ${esc(r.new_supplier)}</div></td>
+          <td class="muted">${esc(r.old_upc)} <span class="muted">· sup ${esc(r.old_supplier)}</span></td>
+          <td class="muted">${esc(r.old_sku)}</td>
+          <td>${lvl(r.match_level)}</td>
+          <td><code>${esc(r.suggested_sku)}</code></td></tr>`).join("")}</tbody></table></div></div>`
+        : '<div class="placeholder"><h2>No replacements found — every active item has distinct history</h2></div>';
+      msg(`Replacement report: ${rows.length} candidates`);
+    } catch (e) { msg(e.message, "error"); }
   };
 
   function msg(text, cls) {

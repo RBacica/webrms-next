@@ -220,7 +220,8 @@ impl Connector for HosConnector {
                     CAST(Price3 AS FLOAT), CAST(Price4 AS FLOAT), CAST(Price5 AS FLOAT), \
                     CAST(Price6 AS FLOAT), CAST(Price7 AS FLOAT), CAST(Price8 AS FLOAT), \
                     CAST(TaxNo AS INT), CAST(PurchaseQty AS FLOAT), \
-                    NonStock, InActive, CONVERT(varchar(23), Updated, 121) \
+                    NonStock, InActive, CONVERT(varchar(23), Updated, 121), \
+                    SupplierProdCode \
              FROM Items \
              {where_clause} \
              {order_clause}");
@@ -244,6 +245,7 @@ impl Connector for HosConnector {
                 class: Some(gi32(r, 5)).filter(|v| *v != 0),
                 supplier: gs(r, 6),
                 parent_upc: gs(r, 7),
+                supplier_prod_code: gs(r, 24),
                 cost: gf(r, 8),
                 cost_ave: gf(r, 9),
                 purchase_cost: gf(r, 10),
@@ -290,6 +292,69 @@ impl Connector for HosConnector {
             upc: gstr(r, 0),
             qty: gf(r, 1),
             as_of: gstr(r, 2),
+        }).collect())
+    }
+
+    async fn pull_payments(&self, branch_id: i32, since: &str) -> anyhow::Result<Vec<LivePayment>> {
+        let mut client = self.connect().await?;
+        let since_clause = if since.is_empty() {
+            String::new()
+        } else {
+            format!("AND th.Logged >= '{since}'")
+        };
+        let sql = format!(
+            "SELECT CONVERT(varchar(10), th.Logged, 120) AS D, \
+                    REPLACE(ISNULL(tp.MediaName, ''), '\"', '') AS Media, \
+                    COUNT(*) AS Cnt, \
+                    CAST(ISNULL(SUM(tp.Value), 0) AS FLOAT) AS Val, \
+                    CAST(ISNULL(SUM(tp.Fee), 0) AS FLOAT) AS Fees, \
+                    CAST(ISNULL(SUM(tp.Change), 0) AS FLOAT) AS Chg \
+             FROM TransPayments tp \
+             JOIN TransHeaders th \
+               ON tp.TransNo = th.TransNo AND tp.Branch = th.Branch AND tp.Station = th.Station \
+             WHERE th.Branch = {branch_id} AND th.TransStatus = 'C' {since_clause} \
+             GROUP BY CONVERT(varchar(10), th.Logged, 120), REPLACE(ISNULL(tp.MediaName, ''), '\"', '') \
+             ORDER BY D, Val DESC");
+        let rows = query_rows(&mut client, &sql).await?;
+        Ok(rows.iter().map(|r| LivePayment {
+            branch_id,
+            sale_date: gstr(r, 0),
+            media: gstr(r, 1),
+            txns: gi(r, 2),
+            value: gf(r, 3),
+            fees: gf(r, 4),
+            change_amt: gf(r, 5),
+        }).collect())
+    }
+
+    async fn pull_hourly(&self, branch_id: i32, since: &str) -> anyhow::Result<Vec<LiveHourly>> {
+        let mut client = self.connect().await?;
+        let since_clause = if since.is_empty() {
+            String::new()
+        } else {
+            format!("AND th.Logged >= '{since}'")
+        };
+        let sql = format!(
+            "SELECT CONVERT(varchar(10), th.Logged, 120) AS D, \
+                    DATEPART(hour, th.Logged) AS Hr, \
+                    (DATEDIFF(day, '1900-01-01', th.Logged) % 7) AS Dow, \
+                    th.Station AS Station, COUNT(*) AS Txns, \
+                    CAST(ISNULL(SUM(th.TotalAfterTax), 0) AS FLOAT) AS Net \
+             FROM TransHeaders th \
+             WHERE th.Branch = {branch_id} AND th.TransStatus = 'C' \
+               AND th.TransType IN ('C','A','M') {since_clause} \
+             GROUP BY CONVERT(varchar(10), th.Logged, 120), DATEPART(hour, th.Logged), \
+                      (DATEDIFF(day, '1900-01-01', th.Logged) % 7), th.Station \
+             ORDER BY D, Hr, Dow, Station");
+        let rows = query_rows(&mut client, &sql).await?;
+        Ok(rows.iter().map(|r| LiveHourly {
+            branch_id,
+            sale_date: gstr(r, 0),
+            hour: gi32(r, 1),
+            dow: gi32(r, 2),
+            station: gi32(r, 3),
+            txns: gi(r, 4),
+            net: gf(r, 5),
         }).collect())
     }
 

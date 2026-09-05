@@ -33,6 +33,11 @@ pub trait Connector: Send + Sync {
     async fn pull_items(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveItem>>;
     async fn pull_barcodes(&self, upcs: &[String]) -> anyhow::Result<Vec<LiveBarcode>>;
     async fn pull_stock(&self, branch_id: i32) -> anyhow::Result<Vec<LiveStock>>;
+    /// Payment-mix rows for one branch from TransPayments (since = YYYY-MM-DD,
+    /// '' = full history).
+    async fn pull_payments(&self, branch_id: i32, since: &str) -> anyhow::Result<Vec<LivePayment>>;
+    /// Hourly-curve rows for one branch from TransHeaders (since = YYYY-MM-DD).
+    async fn pull_hourly(&self, branch_id: i32, since: &str) -> anyhow::Result<Vec<LiveHourly>>;
     async fn pull_sales(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveSaleLine>>;
     async fn pull_receipts(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveReceipt>>;
     async fn pull_ap(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveApInvoice>>;
@@ -90,6 +95,7 @@ pub struct LiveItem {
     pub class: Option<i32>,
     pub supplier: Option<String>,
     pub parent_upc: Option<String>,
+    pub supplier_prod_code: Option<String>,
     pub cost: f64,
     pub cost_ave: f64,
     pub purchase_cost: f64,
@@ -113,6 +119,28 @@ pub struct LiveItem {
 pub struct LiveBarcode {
     pub upc: String,
     pub barcode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LivePayment {
+    pub branch_id: i32,
+    pub sale_date: String,
+    pub media: String,
+    pub txns: i64,
+    pub value: f64,
+    pub fees: f64,
+    pub change_amt: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveHourly {
+    pub branch_id: i32,
+    pub sale_date: String,
+    pub hour: i32,
+    pub dow: i32,
+    pub station: i32,
+    pub txns: i64,
+    pub net: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

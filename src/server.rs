@@ -28,6 +28,7 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/api/sync/up", post(replication::sync_up_route))
         .route("/api/sync/snapshot", get(sync_snapshot))
         .merge(crate::modules::stocktake::handlers::routes())
+        .merge(crate::modules::items::handlers::routes())
         .merge(crate::modules::ordering::handlers::routes())
         .merge(crate::modules::payables::handlers::routes())
         .merge(crate::modules::promotions::handlers::routes())

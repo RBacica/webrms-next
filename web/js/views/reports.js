@@ -9,6 +9,8 @@ const REPORTS = [
   { id: "stock", label: "Stock Valuation" },
   { id: "stocktakes", label: "Stocktake & Shrink" },
   { id: "receipts", label: "GRN ↔ AP" },
+  { id: "payments", label: "Payment Mix" },
+  { id: "hourly", label: "Hourly Curve" },
   { id: "promo", label: "Promo Effectiveness" },
 ];
 
@@ -92,13 +94,28 @@ export async function render(el, { API, SERVER }) {
         }
         case "stocktakes": {
           const d = await API.get("/api/reports/stocktakes");
-          lastData = { head: ["Started", "Branch", "Status", "Count file", "Ticket file"], rows: d.map((r) => [r.started_at, r.branch_id ?? "", r.status, r.count_file ?? "", r.ticket_file ?? ""]) };
+          lastData = { head: ["Started", "Branch", "Status", "Lines", "Shrink $", "Overage $", "Count file"], rows: d.map((r) => [r.started_at, r.branch_id ?? "", r.status, r.lines.length, `$${r.shrink_total}`, `$${r.overage_total}`, r.count_file ?? ""]) };
+          const totalShrink = d.reduce((a, r) => a + (r.shrink_total || 0), 0);
+          const totalOverage = d.reduce((a, r) => a + (r.overage_total || 0), 0);
           res.innerHTML = d.length
-            ? tbl(["Started", "Branch", "Status", "Count file", "Ticket file"], d.map((r) => `<tr>
-                <td>${esc(r.started_at)}</td><td class="num">${r.branch_id ?? ""}</td>
-                <td><span class="ok">${esc(r.status)}</span></td>
-                <td class="muted">${esc((r.count_file || "").split("/").pop())}</td>
-                <td class="muted">${esc((r.ticket_file || "").split("/").pop())}</td></tr>`).join(""))
+            ? `
+            <div class="stats-row">
+              <div class="stat"><span class="stat-val bad">${fmt$(totalShrink)}</span><span class="stat-lbl">total shrink $</span></div>
+              <div class="stat"><span class="stat-val ok">${fmt$(totalOverage)}</span><span class="stat-lbl">total overage $</span></div>
+            </div>
+            ${d.map((r) => `
+              <div class="panel" style="margin-bottom:8px">
+                <h4>${esc(r.started_at)} <span class="muted">· branch ${r.branch_id ?? "—"} · ${r.lines.length} lines</span>
+                  <span class="muted">shrink ${fmt$(r.shrink_total)}</span> <span class="muted">overage ${fmt$(r.overage_total)}</span></h4>
+                <details><summary class="muted">Show lines (${r.lines.length})</summary>
+                <div class="table-wrap"><table><thead><tr><th>UPC</th><th>Product</th><th class="num">SOH</th><th class="num">Counted</th><th class="num">Var units</th><th class="num">Unit $</th><th class="num">Var $</th></tr></thead>
+                <tbody>${r.lines.map((l) => `<tr>
+                  <td class="muted">${esc(l.upc)}</td><td>${esc(l.description || "")}</td>
+                  <td class="num">${l.stock_on_hand}</td><td class="num">${l.counted}</td>
+                  <td class="num">${l.variance_units}</td><td class="num">${l.unit_cost ?? "—"}</td>
+                  <td class="num">${fmt$(l.variance_cost)}</td></tr>`).join("")}</tbody></table></div>
+                </details>
+              </div>`).join("")}`
             : '<div class="placeholder"><h2>No stocktake exports yet — export one from Stocktake</h2></div>';
           break;
         }
@@ -112,6 +129,32 @@ export async function render(el, { API, SERVER }) {
                 <td class="num">${fmt$(r.goods_in)}</td><td class="num">${fmt$(r.returns)}</td><td class="num">${fmt$(r.net_grn)}</td>
                 <td class="num">${fmt$(r.ap_invoiced)}</td><td class="num">${fmt$(r.variance)}</td></tr>`).join(""))
             : '<div class="placeholder"><h2>No receipts or AP in range</h2></div>';
+          break;
+        }
+        case "payments": {
+          const d = await API.get(`/api/reports/payments?from=${f}&to=${t}${branchQ()}`);
+          lastData = { head: ["Media", "Txns", "Value", "Fees", "Change"], rows: d.map((r) => [r.media, r.txns, `$${r.value}`, `$${r.fees}`, `$${r.change_amt}`]) };
+          const total = d.reduce((a, r) => a + (r.value || 0), 0);
+          res.innerHTML = d.length
+            ? `<div class="stats-row"><div class="stat"><span class="stat-val">${fmt$(total)}</span><span class="stat-lbl">total takings</span></div></div>` +
+              tbl(["Media", "Txns", "Value", "Fees", "Change"], d.map((r) => `<tr>
+                <td>${esc(r.media) || "—"}</td><td class="num">${r.txns}</td>
+                <td class="num">${fmt$(r.value)}</td><td class="num">${fmt$(r.fees)}</td><td class="num">${fmt$(r.change_amt)}</td></tr>`).join(""))
+            : '<div class="placeholder"><h2>No payment data in range — connector pulls TransPayments daily</h2></div>';
+          break;
+        }
+        case "hourly": {
+          const d = await API.get(`/api/reports/hourly?from=${f}&to=${t}${branchQ()}`);
+          lastData = { head: ["Hour", "Txns", "Net", "Stations"], rows: d.map((r) => [r.hour, r.txns, `$${r.net}`, r.stations]) };
+          const max = d.reduce((a, r) => Math.max(a, r.txns || 0), 0);
+          res.innerHTML = d.length
+            ? tbl(["Hour", "Txns", "Net", "Stations", "Curve"], d.map((r) => {
+                const w = max ? Math.round((r.txns / max) * 100) : 0;
+                return `<tr><td class="num">${String(r.hour).padStart(2, "0")}:00</td>
+                  <td class="num">${r.txns}</td><td class="num">${fmt$(r.net)}</td><td class="num">${r.stations}</td>
+                  <td><div style="background:var(--accent);height:10px;width:${w}%;border-radius:5px"></div></td></tr>`;
+              }).join(""))
+            : '<div class="placeholder"><h2>No hourly data in range — connector pulls TransHeaders daily</h2></div>';
           break;
         }
         case "promo": {

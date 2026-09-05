@@ -1166,6 +1166,12 @@ async fn stocktake_export_records_run() {
     assert_eq!(st, StatusCode::OK, "export: {body}");
     let (_, body2) = get(&app, "/api/reports/stocktakes").await;
     assert!(body2.contains("\"status\":\"exported\""), "run recorded: {body2}");
+    // G-3 costed variance: item cost $40 → counted 7 vs SOH 8 = −1 unit = −$40 shrink
+    assert!(body2.contains("\"shrink_total\":-40.0"), "costed shrink total: {body2}");
+    assert!(body2.contains("\"overage_total\":0.0"), "no overage: {body2}");
+    assert!(body2.contains("\"variance_units\":-1.0"), "variance units: {body2}");
+    assert!(body2.contains("\"variance_cost\":-40.0"), "variance cost: {body2}");
+    assert!(body2.contains("5010677014205"), "line upc present: {body2}");
 }
 
 // ── Ordering sheet batching: branch-scoped vs all-branch semantics ──────────
@@ -1217,4 +1223,95 @@ async fn order_sheet_batched_semantics_branch_and_all() {
         "all-branch history sums across branches (was silently empty pre-fix): all rate30 {} vs branch2 rate30 {}",
         ja.result.rate30, j.result.rate30
     );
+}
+
+// ── W6: item clone (user convention) + edit ETL + O-12 override protection ──
+
+#[tokio::test]
+async fn items_clone_edit_and_o12_protection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO items (id, upc, sku, description, supplier_id, cost, cost_ave, price1, pack_units, is_active, source) \
+                 VALUES (1, '5010677014205', '5010677014205', 'Jameson 1L', 1, 40.0, 40.0, 59.99, 1, 1, 'connector')")
+        .execute(&pool).await.unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "hos".into();
+    cfg.sync.install_name = "hos-1".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state.clone());
+
+    // clone 5010677014205 → 999000123456 w/ a cost edit
+    let (st, body) = post(&app, "/api/items/clone",
+        r#"{"from_upc":"5010677014205","new_upc":"999000123456","operator":"tester","fields":{"cost":44.5,"is_active":true}}"#).await;
+    assert_eq!(st, StatusCode::OK, "clone: {body}");
+
+    // user convention verified: new item exists w/ alt barcode = old; old item retired OLD_<new>
+    let new_item = webrms_next::modules::items::db::get(&state.pool_arc(), "999000123456").await.unwrap().unwrap();
+    assert_eq!(new_item.cost, 44.5, "edited cost on the clone");
+    let old_item = webrms_next::modules::items::db::get(&state.pool_arc(), "5010677014205").await.unwrap().unwrap();
+    assert!(!old_item.is_active, "old item retired");
+    let alt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_barcodes WHERE upc='999000123456' AND barcode='5010677014205'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(alt, 1, "new item alt-barcodes the old upc");
+    let sku: String = sqlx::query_scalar("SELECT sku FROM items WHERE upc='5010677014205'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(sku, "OLD_999000123456", "old SKU renamed");
+    let alias: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM history_alias WHERE old_upc='5010677014205' AND new_upc='999000123456'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(alias, 1, "history alias recorded");
+
+    // O-12: the cost override exists and the connector must keep the app value
+    let ov: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_overrides WHERE entity_type='item' AND entity_key='999000123456' AND field='cost'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(ov, 1, "cost override stored");
+
+    // edit endpoint writes an ETL patch file
+    let (st, body) = post(&app, "/api/items/etl", r#"{"kind":"edit","upc":"999000123456"}"#).await;
+    assert_eq!(st, StatusCode::OK, "etl patch: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["filename"].as_str().unwrap().starts_with("Item-edit-"), "{body}");
+    let fname = v["filename"].as_str().unwrap().to_string();
+    let (st, _) = get(&app, &format!("/api/items/patch/{fname}")).await;
+    assert_eq!(st, StatusCode::OK, "patch downloadable");
+    let p = tmp.path().join("output/items").join(&fname);
+    assert!(p.exists(), "patch written to output/items");
+
+}
+
+
+// ── Payment Mix + Hourly Curve over local rollups ────────────────────────────
+
+#[tokio::test]
+async fn reports_payments_and_hourly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (2, 'BoS', 0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO sales_payment (branch_id, sale_date, media, txns, value, fees, change_amt) VALUES \
+                 (2, '2026-08-15', 'EFTPOS', 12, 300.0, 1.5, 0.0), \
+                 (2, '2026-08-15', 'CASH', 5, 100.0, 0.0, 4.0), \
+                 (2, '2026-08-16', 'CASH', 2, 50.0, 0.0, 2.0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO sales_hourly (branch_id, sale_date, hour, dow, station, txns, net) VALUES \
+                 (2, '2026-08-15', 9, 6, 1, 10, 200.0), \
+                 (2, '2026-08-15', 10, 6, 1, 25, 500.0), \
+                 (2, '2026-08-16', 9, 0, 1, 8, 150.0)")
+        .execute(&pool).await.unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "hos".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state);
+
+    let (st, body) = get(&app, "/api/reports/payments?from=2026-08-01&to=2026-08-31&branch=2").await;
+    assert_eq!(st, StatusCode::OK, "payments: {body}");
+    assert!(body.contains("EFTPOS"), "{body}");
+    assert!(body.contains("\"value\":300.0"), "{body}");
+    assert!(body.contains("\"value\":150.0"), "cash aggregated across days: {body}");
+
+    let (st, body) = get(&app, "/api/reports/hourly?from=2026-08-01&to=2026-08-31&branch=2").await;
+    assert_eq!(st, StatusCode::OK, "hourly: {body}");
+    assert!(body.contains("\"hour\":9"), "{body}");
+    assert!(body.contains("\"net\":500.0"), "{body}");
 }

@@ -381,3 +381,57 @@ fn assemble_history(
     }
     ProductHistory { daily, promo_days, upcoming_promos }
 }
+
+// ── Replacement report (W6 predecessor scan) ─────────────────────────────────
+// Ported from old WebRMS ordering db (b285e95): for every ACTIVE item that has
+// an INACTIVE same-description sibling, report the sibling as a possible
+// predecessor + a match level + the suggested OLD_<new UPC> SKU to set.
+// Match level: 3 = already OLD_<new upc>-named, 2 = same supplier product code,
+// 1 = same supplier, 0 = neither. Only inactive items with local sales history
+// count (they were real sellers).
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct ReplacementRow {
+    pub new_upc: String,
+    pub description: String,
+    pub new_supplier: String,
+    pub old_upc: String,
+    pub old_sku: String,
+    pub old_supplier: String,
+    pub match_level: i64,
+    pub suggested_sku: String,
+}
+
+pub async fn replacement_report(pool: &SqlitePool) -> anyhow::Result<Vec<ReplacementRow>> {
+    let rows: Vec<(String, String, String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT a.upc, COALESCE(a.description, ''), COALESCE(sa.code, ''), \
+                b.upc, COALESCE(b.sku, ''), COALESCE(sb.code, ''), \
+                CASE WHEN b.sku = 'OLD_' || a.upc OR b.sku = 'OLD_' || substr(a.upc, -6) THEN 3 \
+                     WHEN COALESCE(a.supplier_prod_code, '') <> '' \
+                          AND a.supplier_prod_code = b.supplier_prod_code THEN 2 \
+                     WHEN a.supplier_id = b.supplier_id THEN 1 ELSE 0 END \
+         FROM items a \
+         LEFT JOIN suppliers sa ON sa.id = a.supplier_id \
+         JOIN items b ON b.description = a.description AND b.upc <> a.upc \
+         LEFT JOIN suppliers sb ON sb.id = b.supplier_id \
+         WHERE a.is_active = 1 AND COALESCE(a.non_stock, 0) = 0 \
+           AND b.is_active = 0 AND b.supplier_id IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM sales_daily sd WHERE sd.upc = b.upc) \
+         ORDER BY a.description, a.upc",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(new_upc, description, new_supplier, old_upc, old_sku, old_supplier, match_level)| ReplacementRow {
+            suggested_sku: format!("OLD_{new_upc}"),
+            new_upc,
+            description,
+            new_supplier,
+            old_upc,
+            old_sku,
+            old_supplier,
+            match_level,
+        })
+        .collect())
+}

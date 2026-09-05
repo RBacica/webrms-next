@@ -661,8 +661,19 @@ pub async fn receipts_report(
     }
 }
 
-/// R-stocktakes: stocktake export history from stocktake_runs (each export
-/// records a row). Costed variance (G-3) is a documented open item.
+/// R-stocktakes: stocktake export history from stocktake_runs with the costed
+/// variance totals (G-3) + per-run counted lines.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct StocktakeRunLine {
+    pub upc: String,
+    pub description: Option<String>,
+    pub stock_on_hand: f64,
+    pub counted: f64,
+    pub unit_cost: Option<f64>,
+    pub variance_units: f64,
+    pub variance_cost: f64,
+}
+
 #[derive(Debug, serde::Serialize, Clone)]
 pub struct StocktakeRow {
     pub id: String,
@@ -672,17 +683,120 @@ pub struct StocktakeRow {
     pub branch_id: Option<i64>,
     pub count_file: Option<String>,
     pub ticket_file: Option<String>,
+    pub shrink_total: f64,
+    pub overage_total: f64,
+    pub lines: Vec<StocktakeRunLine>,
 }
 
 pub async fn stocktakes_report(pool: &SqlitePool) -> anyhow::Result<Vec<StocktakeRow>> {
-    let rows: Vec<(String, String, Option<String>, String, Option<i64>, Option<String>, Option<String>)> =
+    let rows: Vec<(String, String, Option<String>, String, Option<i64>, Option<String>, Option<String>, f64, f64)> =
         sqlx::query_as(
-            "SELECT id, started_at, completed_at, status, branch_id, count_file, ticket_file \
-             FROM stocktake_runs ORDER BY started_at DESC LIMIT 200",
+            "SELECT id, started_at, completed_at, status, branch_id, count_file, ticket_file, \
+                    CAST(COALESCE(shrink_total,0) AS REAL), CAST(COALESCE(overage_total,0) AS REAL) \
+             FROM stocktake_runs ORDER BY started_at DESC LIMIT 100",
         )
         .fetch_all(pool)
         .await?;
-    Ok(rows.into_iter().map(|(id, s, c, st, b, cf, tf)| StocktakeRow {
-        id, started_at: s, completed_at: c, status: st, branch_id: b, count_file: cf, ticket_file: tf,
-    }).collect())
+    if rows.is_empty() {
+        return Ok(vec![]);
+    }
+    // one batched query for all runs' lines
+    let line_rows: Vec<(String, String, Option<String>, f64, f64, Option<f64>, f64, f64)> =
+        sqlx::query_as(
+            "SELECT run_id, upc, description, stock_on_hand, counted, unit_cost, \
+                    CAST(COALESCE(variance_units,0) AS REAL), CAST(COALESCE(variance_cost,0) AS REAL) \
+             FROM stocktake_run_lines WHERE run_id IN (SELECT id FROM stocktake_runs) \
+             ORDER BY run_id, upc",
+        )
+        .fetch_all(pool)
+        .await?;
+    let mut by_run: std::collections::HashMap<String, Vec<StocktakeRunLine>> =
+        std::collections::HashMap::new();
+    for (run_id, upc, description, soh, counted, uc, vu, vc) in line_rows {
+        by_run.entry(run_id).or_default().push(StocktakeRunLine {
+            upc,
+            description,
+            stock_on_hand: soh,
+            counted,
+            unit_cost: uc,
+            variance_units: vu,
+            variance_cost: vc,
+        });
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(id, s, c, st, b, cf, tf, shrink, overage)| StocktakeRow {
+            shrink_total: shrink,
+            overage_total: overage,
+            lines: by_run.remove(&id).unwrap_or_default(),
+            id: id.clone(),
+            started_at: s,
+            completed_at: c,
+            status: st,
+            branch_id: b,
+            count_file: cf,
+            ticket_file: tf,
+        })
+        .collect())
+}
+
+// ── Payment Mix + Hourly Curve (header-level rollups, migration 0013) ────────
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct PaymentRow {
+    pub media: String,
+    pub txns: i64,
+    pub value: f64,
+    pub fees: f64,
+    pub change_amt: f64,
+}
+
+pub async fn payment_mix(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>) -> anyhow::Result<Vec<PaymentRow>> {
+    let rows: Vec<(String, i64, f64, f64, f64)> = if let Some(b) = branch {
+        sqlx::query_as(
+            "SELECT media, SUM(txns), CAST(SUM(value) AS REAL), CAST(SUM(fees) AS REAL), CAST(SUM(change_amt) AS REAL) \
+             FROM sales_payment WHERE branch_id = ?1 AND sale_date >= ?2 AND sale_date <= ?3 \
+             GROUP BY media ORDER BY SUM(value) DESC",
+        )
+        .bind(b).bind(from).bind(to)
+        .fetch_all(pool).await?
+    } else {
+        sqlx::query_as(
+            "SELECT media, SUM(txns), CAST(SUM(value) AS REAL), CAST(SUM(fees) AS REAL), CAST(SUM(change_amt) AS REAL) \
+             FROM sales_payment WHERE sale_date >= ?1 AND sale_date <= ?2 \
+             GROUP BY media ORDER BY SUM(value) DESC",
+        )
+        .bind(from).bind(to)
+        .fetch_all(pool).await?
+    };
+    Ok(rows.into_iter().map(|(media, txns, value, fees, change_amt)| PaymentRow { media, txns, value, fees, change_amt }).collect())
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct HourlyRow {
+    pub hour: i32,
+    pub txns: i64,
+    pub net: f64,
+    pub stations: i64,
+}
+
+pub async fn hourly_curve(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>) -> anyhow::Result<Vec<HourlyRow>> {
+    let rows: Vec<(i32, i64, f64, i64)> = if let Some(b) = branch {
+        sqlx::query_as(
+            "SELECT hour, SUM(txns), CAST(SUM(net) AS REAL), COUNT(DISTINCT station) \
+             FROM sales_hourly WHERE branch_id = ?1 AND sale_date >= ?2 AND sale_date <= ?3 \
+             GROUP BY hour ORDER BY hour",
+        )
+        .bind(b).bind(from).bind(to)
+        .fetch_all(pool).await?
+    } else {
+        sqlx::query_as(
+            "SELECT hour, SUM(txns), CAST(SUM(net) AS REAL), COUNT(DISTINCT station) \
+             FROM sales_hourly WHERE sale_date >= ?1 AND sale_date <= ?2 \
+             GROUP BY hour ORDER BY hour",
+        )
+        .bind(from).bind(to)
+        .fetch_all(pool).await?
+    };
+    Ok(rows.into_iter().map(|(hour, txns, net, stations)| HourlyRow { hour, txns, net, stations }).collect())
 }

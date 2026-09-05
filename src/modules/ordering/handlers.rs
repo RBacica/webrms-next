@@ -27,6 +27,7 @@ pub fn routes() -> axum::Router<SharedState> {
         .route("/api/ordering/settings", axum::routing::get(ordering_settings).post(save_ordering_settings))
         .route("/api/ordering/modes", axum::routing::post(save_supplier_mode))
         .route("/api/ordering/export", axum::routing::post(export_csv))
+        .route("/api/ordering/replacement-report", axum::routing::get(replacement_report))
         .route("/api/sync/incoming-po", axum::routing::get(incoming_po).delete(delete_incoming_po))
 }
 
@@ -566,6 +567,18 @@ async fn export_csv(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Failed to write export: {e}") })),
+        ),
+    }
+}
+
+/// GET /api/ordering/replacement-report — inactive same-description
+/// predecessors of active items (W6 clone diagnostics).
+async fn replacement_report(State(state): State<SharedState>) -> impl IntoResponse {
+    match db::replacement_report(&*state.pool_arc()).await {
+        Ok(rows) => (StatusCode::OK, Json(json!({ "rows": rows }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
         ),
     }
 }

@@ -179,8 +179,9 @@ async fn export_rows(
     let count_rows = result.count_rows;
     let ticket_rows = result.ticket_rows;
 
-    // Record the run (stocktake_runs) so the Reports → Stocktake & Shrink page
-    // has export history. Costed variance (G-3) is a documented open item.
+    // Record the run + lines (stocktake_runs + stocktake_run_lines) so the
+    // Reports → Stocktake & Shrink page has export history AND costed variance
+    // (G-3): shrink_total / overage_total computed here from unit costs.
     let _ = record_run(&state, &result, &req).await;
 
     if destination == "client" {
@@ -225,7 +226,9 @@ async fn export_rows(
 }
 
 /// Insert a stocktake_runs row after a successful export (branch from the
-/// request's branch field when present; best-effort).
+/// request when present; best-effort), persist the counted lines, and compute
+/// the costed variance totals (G-3). Unit costs come from items (one batched
+/// lookup for the whole export).
 async fn record_run(
     state: &crate::state::SharedState,
     result: &exports::ExportResult,
@@ -237,16 +240,72 @@ async fn record_run(
         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
         .unwrap_or_else(|_| result.timestamp.clone());
     let branch_id = req.branch.map(|b| b as i64);
+    let pool = state.pool_arc();
+    let run_id = Uuid::new_v4().to_string();
+
+    // batch unit costs for the counted upcs
+    let upcs: Vec<&str> = req.rows.iter().map(|r| r.upc.as_str()).collect();
+    let mut cost_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for chunk in upcs.chunks(400) {
+        let mut q = sqlx::QueryBuilder::new(
+            "SELECT upc, CAST(COALESCE(NULLIF(cost,0), cost_ave, purchase_cost, 0) AS REAL) \
+             FROM items WHERE upc IN (",
+        );
+        let mut sep = q.separated(", ");
+        for u in chunk {
+            sep.push_bind(*u);
+        }
+        q.push(")");
+        for (upc, cost) in q.build_query_as::<(String, f64)>().fetch_all(&*pool).await? {
+            cost_map.insert(upc, cost);
+        }
+    }
+
+    let mut shrink = 0.0f64;
+    let mut overage = 0.0f64;
+    for r in &req.rows {
+        let var_units = r.count - r.stock_on_hand;
+        let var_cost = var_units * cost_map.get(&r.upc).copied().unwrap_or(0.0);
+        if var_units < 0.0 {
+            shrink += var_cost; // negative — stock shortfall
+        } else if var_units > 0.0 {
+            overage += var_cost;
+        }
+    }
+
+    let mut tx = pool.begin().await?;
     sqlx::query(
-        "INSERT INTO stocktake_runs (id, branch_id, started_at, status, count_file, ticket_file) \
-         VALUES (?1, ?2, ?3, 'exported', ?4, ?5)",
+        "INSERT INTO stocktake_runs (id, branch_id, started_at, status, count_file, ticket_file, shrink_total, overage_total) \
+         VALUES (?1, ?2, ?3, 'exported', ?4, ?5, ?6, ?7)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&run_id)
     .bind(branch_id)
     .bind(&started_db)
     .bind(result.count_path.clone())
     .bind(result.ticket_path.clone())
-    .execute(&*state.pool_arc())
+    .bind(shrink)
+    .bind(overage)
+    .execute(&mut *tx)
     .await?;
+    for r in &req.rows {
+        let var_units = r.count - r.stock_on_hand;
+        let unit_cost = cost_map.get(&r.upc).copied();
+        let var_cost = var_units * unit_cost.unwrap_or(0.0);
+        sqlx::query(
+            "INSERT INTO stocktake_run_lines (run_id, upc, description, stock_on_hand, counted, unit_cost, variance_units, variance_cost) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(&run_id)
+        .bind(&r.upc)
+        .bind(&r.description)
+        .bind(r.stock_on_hand)
+        .bind(r.count)
+        .bind(unit_cost)
+        .bind(var_units)
+        .bind(var_cost)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }

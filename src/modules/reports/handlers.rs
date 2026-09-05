@@ -29,6 +29,8 @@ pub fn routes() -> axum::Router<SharedState> {
         .route("/api/reports/stock", axum::routing::get(get_stock))
         .route("/api/reports/receipts", axum::routing::get(get_receipts))
         .route("/api/reports/stocktakes", axum::routing::get(get_stocktakes))
+        .route("/api/reports/payments", axum::routing::get(get_payments))
+        .route("/api/reports/hourly", axum::routing::get(get_hourly))
 }
 
 #[derive(Deserialize)]
@@ -181,5 +183,35 @@ async fn get_stocktakes(State(state): State<SharedState>) -> impl IntoResponse {
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Database error: {e}") })),
         ),
+    }
+}
+
+// ── Payment Mix + Hourly Curve ───────────────────────────────────────────────
+
+async fn get_payments(
+    State(state): State<SharedState>,
+    Query(query): Query<ReportQuery>,
+) -> impl IntoResponse {
+    let (Some(from), Some(to)) = (query.from.clone(), query.to.clone()) else {
+        return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
+    };
+    let branch = effective_branch(&state, query.branch).map(|b| b as i64);
+    match db::payment_mix(&*state.pool_arc(), &from, &to, branch).await {
+        Ok(rows) => (StatusCode::OK, Json(json!(rows))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Database error: {e}") }))),
+    }
+}
+
+async fn get_hourly(
+    State(state): State<SharedState>,
+    Query(query): Query<ReportQuery>,
+) -> impl IntoResponse {
+    let (Some(from), Some(to)) = (query.from.clone(), query.to.clone()) else {
+        return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
+    };
+    let branch = effective_branch(&state, query.branch).map(|b| b as i64);
+    match db::hourly_curve(&*state.pool_arc(), &from, &to, branch).await {
+        Ok(rows) => (StatusCode::OK, Json(json!(rows))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Database error: {e}") }))),
     }
 }

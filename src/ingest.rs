@@ -3,6 +3,7 @@
 // interrupted seed/poll continues where it left off (O-4).
 
 use anyhow::Context;
+use serde_json::json;
 use sqlx::sqlite::SqlitePool;
 
 use crate::connector::{Connector, HighWater};
@@ -73,13 +74,21 @@ pub async fn ingest_reference<C: Connector + ?Sized>(
 pub async fn ingest_items<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str) -> anyhow::Result<u64> {
     let mut hw = load_hw(pool, source, "items").await?;
     let mut total: u64 = 0;
+    // O-12: UPCs with app_overrides are protected — the connector must never
+    // silently overwrite an app-edited value. Load the set once per ingest.
+    let overridden_upcs: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT DISTINCT entity_key FROM app_overrides WHERE entity_type = 'item'")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
     loop {
         let batch = conn.pull_items(&hw, BATCH).await?;
         let n = batch.rows.len();
         if n == 0 { break; }
         let mut tx = pool.begin().await?;
         for it in &batch.rows {
-            upsert_item(&mut tx, source, it).await?;
+            upsert_item(&mut tx, source, it, &overridden_upcs).await?;
         }
         // persist high-water inside the same txn as the batch
         if let Some(k) = &batch.next_key {
@@ -347,22 +356,85 @@ async fn upsert_supplier(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, source: &
     Ok(())
 }
 
-async fn upsert_item(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, source: &str, it: &crate::connector::LiveItem) -> anyhow::Result<()> {
+async fn upsert_item(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    source: &str,
+    it: &crate::connector::LiveItem,
+    overridden_upcs: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
     let dept_id: Option<i64> = sqlx::query_scalar("SELECT id FROM departments WHERE ext_key = ?1")
         .bind(it.department).fetch_optional(&mut **tx).await?;
     let sup_id: Option<i64> = sqlx::query_scalar("SELECT id FROM suppliers WHERE code = ?1")
         .bind(it.supplier.as_deref().unwrap_or("")).fetch_optional(&mut **tx).await?;
+
+    // O-12 merge rule: when the upc has app_overrides, the APP value wins for
+    // the overridden field (never silently clobbered by the connector), and a
+    // live value that differs from the override flags external_edit.
+    let overrides: std::collections::HashMap<String, serde_json::Value> = if overridden_upcs.contains(&it.upc) {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT field, value FROM app_overrides WHERE entity_type = 'item' AND entity_key = ?1",
+        )
+        .bind(&it.upc)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|(f, v)| (f, serde_json::from_str(&v).unwrap_or(serde_json::Value::Null)))
+        .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    let ov = |field: &str, live: serde_json::Value| -> serde_json::Value {
+        overrides.get(field).cloned().unwrap_or(live)
+    };
+    // resolves supplier override code → id (fallback to live mapping)
+    let sup_id_eff: Option<i64> = match overrides.get("supplier_code") {
+        Some(v) => match v.as_str() {
+            Some(code) if !code.is_empty() => sqlx::query_scalar("SELECT id FROM suppliers WHERE code = ?1")
+                .bind(code).fetch_optional(&mut **tx).await?,
+            _ => None,
+        },
+        None => sup_id,
+    };
+
+    // tax_code is TEXT locally; the live value is an int code. Normalise both
+    // sides to strings for the merge + external-edit comparison.
+    let live_tax = it.tax_no.map(|t| t.to_string());
+    let tax_eff: Option<String> = overrides.get("tax_code").and_then(|v| v.as_str()).map(|s| s.to_string()).or_else(|| live_tax.clone());
+
+    let live_fields: Vec<(&str, serde_json::Value)> = vec![
+        ("sku", json!(it.sku)),
+        ("description", json!(it.description)),
+        ("supplier_prod_code", json!(it.supplier_prod_code)),
+        ("cost", json!(it.cost)),
+        ("cost_ave", json!(it.cost_ave)),
+        ("purchase_cost", json!(it.purchase_cost)),
+        ("price1", json!(it.price1)),
+        ("price2", json!(it.price2)),
+        ("price3", json!(it.price3)),
+        ("price4", json!(it.price4)),
+        ("price5", json!(it.price5)),
+        ("price6", json!(it.price6)),
+        ("price7", json!(it.price7)),
+        ("price8", json!(it.price8)),
+        ("pack_units", json!(it.pack_units)),
+        ("volume_ml", json!(it.volume_ml)),
+        ("tax_code", json!(live_tax)),
+        ("non_stock", json!(it.non_stock)),
+        ("is_active", json!(!it.inactive)),
+    ];
+
     sqlx::query(
         "INSERT INTO items (upc, source, source_key, sku, description, department_id, supplier_id, \
-                parent_upc, class, sub_department, cost, cost_ave, purchase_cost, \
+                parent_upc, supplier_prod_code, class, sub_department, cost, cost_ave, purchase_cost, \
                 price1, price2, price3, price4, price5, price6, price7, price8, \
                 tax_code, pack_units, volume_ml, non_stock, is_active, last_synced_at) \
          VALUES (?1, ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, datetime('now')) \
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, datetime('now')) \
          ON CONFLICT(upc) DO UPDATE SET \
            source=excluded.source, source_key=excluded.source_key, sku=excluded.sku, \
            description=excluded.description, department_id=excluded.department_id, \
            supplier_id=excluded.supplier_id, parent_upc=excluded.parent_upc, \
+           supplier_prod_code=excluded.supplier_prod_code, \
            class=excluded.class, sub_department=excluded.sub_department, \
            cost=excluded.cost, cost_ave=excluded.cost_ave, purchase_cost=excluded.purchase_cost, \
            price1=excluded.price1, price2=excluded.price2, price3=excluded.price3, \
@@ -371,15 +443,48 @@ async fn upsert_item(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, source: &str,
            pack_units=excluded.pack_units, volume_ml=excluded.volume_ml, \
            non_stock=excluded.non_stock, is_active=excluded.is_active, last_synced_at=excluded.last_synced_at",
     )
-    .bind(&it.upc).bind(source).bind(&it.sku).bind(&it.description)
-    .bind(dept_id).bind(sup_id).bind(&it.parent_upc)
+    .bind(&it.upc).bind(source)
+    .bind(ov("sku", json!(it.sku)).as_str().unwrap_or("").to_string())
+    .bind(ov("description", json!(it.description)).as_str().unwrap_or("").to_string())
+    .bind(dept_id).bind(sup_id_eff).bind(&it.parent_upc)
+    .bind(ov("supplier_prod_code", json!(it.supplier_prod_code)).as_str().map(|s| s.to_string()))
     .bind(it.class).bind(it.sub_department)
-    .bind(it.cost).bind(it.cost_ave).bind(it.purchase_cost)
-    .bind(it.price1).bind(it.price2).bind(it.price3).bind(it.price4)
-    .bind(it.price5).bind(it.price6).bind(it.price7).bind(it.price8)
-    .bind(it.tax_no).bind(it.pack_units).bind(it.volume_ml)
-    .bind(it.non_stock).bind(!it.inactive)
+    .bind(ov("cost", json!(it.cost)).as_f64().unwrap_or(it.cost))
+    .bind(ov("cost_ave", json!(it.cost_ave)).as_f64().unwrap_or(it.cost_ave))
+    .bind(ov("purchase_cost", json!(it.purchase_cost)).as_f64().unwrap_or(it.purchase_cost))
+    .bind(ov("price1", json!(it.price1)).as_f64().unwrap_or(it.price1))
+    .bind(ov("price2", json!(it.price2)).as_f64().unwrap_or(it.price2))
+    .bind(ov("price3", json!(it.price3)).as_f64().unwrap_or(it.price3))
+    .bind(ov("price4", json!(it.price4)).as_f64().unwrap_or(it.price4))
+    .bind(ov("price5", json!(it.price5)).as_f64().unwrap_or(it.price5))
+    .bind(ov("price6", json!(it.price6)).as_f64().unwrap_or(it.price6))
+    .bind(ov("price7", json!(it.price7)).as_f64().unwrap_or(it.price7))
+    .bind(ov("price8", json!(it.price8)).as_f64().unwrap_or(it.price8))
+    .bind(tax_eff)
+    .bind(ov("pack_units", json!(it.pack_units)).as_f64().unwrap_or(it.pack_units))
+    .bind(ov("volume_ml", json!(it.volume_ml)).as_f64().or(it.volume_ml))
+    .bind(ov("non_stock", json!(it.non_stock)).as_bool().unwrap_or(it.non_stock))
+    .bind(ov("is_active", json!(!it.inactive)).as_bool().unwrap_or(!it.inactive))
     .execute(&mut **tx).await?;
+
+    // flag external edits: an overridden field whose LIVE value ≠ the stored
+    // override means someone changed it directly in Infinity — surface it.
+    if !overrides.is_empty() {
+        for (field, stored) in &overrides {
+            let live = live_fields.iter().find(|(f, _)| f == field).map(|(_, v)| v).unwrap_or(&serde_json::Value::Null);
+            let conflict = match (field.as_str(), stored, live) {
+                ("description" | "sku" | "supplier_prod_code", serde_json::Value::String(a), serde_json::Value::String(b)) => a != b,
+                (_, serde_json::Value::Number(_) | serde_json::Value::Bool(_), _) => stored != live,
+                _ => false,
+            };
+            if conflict {
+                sqlx::query("UPDATE app_overrides SET conflict_state = 'external_edit' \
+                             WHERE entity_type = 'item' AND entity_key = ?1 AND field = ?2")
+                    .bind(&it.upc).bind(field)
+                    .execute(&mut **tx).await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -438,6 +543,51 @@ pub async fn run_seed<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source
     let promos = ingest_promos(pool, conn, source).await?;
     let rbp = ingest_rbp(pool, conn, source).await?;
 
-    tracing::info!("=== seed complete: items={items} stock={stock} sales={sales} receipts={receipts} ap={ap} promos={promos} rbp={rbp} ===");
+    let ext = ingest_sales_ext(pool, conn, source, true).await?;
+    tracing::info!("=== seed complete: items={items} stock={stock} sales={sales} receipts={receipts} ap={ap} promos={promos} rbp={rbp} ext={ext} ===");
     Ok(())
+}
+
+/// Payment-mix + hourly rollups (header-level). Seed: '' = full history;
+/// poll: trailing 3 days (idempotent date-keyed upserts, small volume).
+pub async fn ingest_sales_ext<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source: &str, full: bool) -> anyhow::Result<u64> {
+    let since = if full {
+        String::new()
+    } else {
+        // trailing 3 days (local date) — re-pulled each poll, upsert-safe
+        (chrono::Local::now().date_naive() - chrono::Duration::days(2)).format("%Y-%m-%d").to_string()
+    };
+    let branch_ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM branches WHERE is_active = 1")
+        .fetch_all(pool).await?;
+    let mut total: u64 = 0;
+    for b in branch_ids {
+        let mut tx = pool.begin().await?;
+        for p in conn.pull_payments(b, &since).await? {
+            sqlx::query(
+                "INSERT INTO sales_payment (branch_id, sale_date, media, txns, value, fees, change_amt) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(branch_id, sale_date, media) DO UPDATE SET \
+                   txns=excluded.txns, value=excluded.value, fees=excluded.fees, change_amt=excluded.change_amt",
+            )
+            .bind(p.branch_id).bind(&p.sale_date).bind(&p.media)
+            .bind(p.txns).bind(p.value).bind(p.fees).bind(p.change_amt)
+            .execute(&mut *tx).await?;
+            total += 1;
+        }
+        for h in conn.pull_hourly(b, &since).await? {
+            sqlx::query(
+                "INSERT INTO sales_hourly (branch_id, sale_date, hour, dow, station, txns, net) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(branch_id, sale_date, hour, dow, station) DO UPDATE SET \
+                   txns=excluded.txns, net=excluded.net",
+            )
+            .bind(h.branch_id).bind(&h.sale_date).bind(h.hour).bind(h.dow).bind(h.station)
+            .bind(h.txns).bind(h.net)
+            .execute(&mut *tx).await?;
+            total += 1;
+        }
+        tx.commit().await?;
+    }
+    let _ = source;
+    Ok(total)
 }
