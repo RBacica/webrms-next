@@ -32,7 +32,7 @@ export async function render(el, { API, SERVER }) {
   </div>
   <div id="st-results" class="panel"><div class="placeholder"><h2>Scan a barcode to start counting</h2></div></div>`;
 
-  const $ = (id) => el.querySelector(id);
+  const $ = (id) => el.querySelector(id.startsWith("#") ? id : "#" + id);
   const qEl = () => $("st-q");
   const msg = (t, cls) => { $("st-msg").className = cls ? `msg ${cls}` : "msg"; $("st-msg").textContent = t; };
   // session: upc → row (description/department/supplier/soh filled on add)

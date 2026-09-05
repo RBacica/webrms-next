@@ -27,7 +27,7 @@ export async function render(el, { API, SERVER }) {
   </div>
   <div id="od-results" class="panel"><div class="placeholder"><h2>Load a supplier sheet</h2></div></div>`;
 
-  const $ = (id) => el.querySelector(id);
+  const $ = (id) => el.querySelector(id.startsWith("#") ? id : "#" + id);
   let sheet = [];
   let showAll = false;
   const author = SERVER.author || SERVER.mode === "hos";

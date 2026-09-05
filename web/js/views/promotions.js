@@ -17,7 +17,7 @@ export async function render(el, { API, SERVER }) {
   </div>
   <div id="pr-results" class="panel"><div class="placeholder"><h2>Loading…</h2></div></div>`;
 
-  const $ = (id) => el.querySelector(id);
+  const $ = (id) => el.querySelector(id.startsWith("#") ? id : "#" + id);
   renderList();
 
   function renderList() {

@@ -17,7 +17,7 @@ export async function render(el, { API, SERVER }) {
   </div>
   <div id="it-results" class="panel"><div class="placeholder"><h2>Search for an item to edit or clone</h2></div></div>`;
 
-  const $ = (id) => el.querySelector(id);
+  const $ = (id) => el.querySelector(id.startsWith("#") ? id : "#" + id);
   const msg = (t, c) => { $("it-msg").className = c ? `msg ${c}` : "msg"; $("it-msg").textContent = t; };
   let current = null;
 

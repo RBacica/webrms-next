@@ -110,7 +110,7 @@ async function route() {
     const mod = await import(`./views/${v}.js?v=${APP_VER}`);
     await mod.render(el, { API, SERVER });
   } catch (e) {
-    el.innerHTML = `<div class="placeholder"><h2>View error</h2><p class="bad">${e.message}</p></div>`;
+    el.innerHTML = `<div class="placeholder"><h2>View error</h2><p class="bad">${e.message}</p><pre style="text-align:left;font-size:11px;color:#c55">${e.stack || ""}</pre></div>`;
   }
   refreshSyncStatus();
 }

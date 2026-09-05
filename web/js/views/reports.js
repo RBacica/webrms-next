@@ -33,7 +33,7 @@ export async function render(el, { API, SERVER }) {
   </div>
   <div id="rp-results" class="panel"><div class="placeholder"><h2>Choose a report</h2></div></div>`;
 
-  const $ = (id) => el.querySelector(id);
+  const $ = (id) => el.querySelector(id.startsWith("#") ? id : "#" + id);
   let current = "daily";
   let lastData = null;
 
