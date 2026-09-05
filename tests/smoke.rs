@@ -931,3 +931,60 @@ async fn fallback_engages_on_dead_connector_and_preserves_local_rows() {
     assert_eq!(meta.via, hos_url, "sidecar records the snapshot source");
     assert!(meta.size_bytes > 0, "sidecar records snapshot size");
 }
+
+// ── P4: backup + doctor ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn backup_create_vacuum_into_holds_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1)")
+        .execute(&pool).await.unwrap();
+    let path = webrms_next::backup::create_backup(tmp.path(), 5).await.unwrap();
+    assert!(path.exists(), "backup file exists");
+    // the backup opens as an independent DB containing the row
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+    let bpool = sqlx::sqlite::SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM branches").fetch_one(&bpool).await.unwrap();
+    assert_eq!(n, 1, "backup carries the data");
+}
+
+#[tokio::test]
+async fn backup_prune_keeps_n_newest() {
+    use std::time::{Duration, SystemTime};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("backup");
+    std::fs::create_dir_all(&dir).unwrap();
+    for i in 0..5u64 {
+        let p = dir.join(format!("webrms-next-backup-20260905-00000{i}.db"));
+        std::fs::write(&p, vec![0u8; 10]).unwrap();
+        let ft = std::fs::FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(i));
+        std::fs::File::open(&p).unwrap().set_times(ft).unwrap();
+    }
+    // an unrelated file in the dir must never be pruned
+    std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+    webrms_next::backup::prune(&dir, 2);
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(left.len(), 3, "2 backups + notes.txt remain: {left:?}");
+    assert!(!left.contains(&"webrms-next-backup-20260905-000000.db".to_string()), "oldest pruned");
+    assert!(left.contains(&"webrms-next-backup-20260905-000003.db".to_string()), "newest kept");
+}
+
+#[tokio::test]
+async fn doctor_scratch_install_passes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "hos".into(); // no connector, no sync
+    let ok = webrms_next::doctor::run(&cfg, tmp.path()).await.unwrap();
+    assert!(ok, "scratch install: db ok, connector disabled, replication disabled");
+}
+
+#[tokio::test]
+async fn parity_requires_live_connector() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    let cfg = AppConfig::default(); // empty connection_string
+    let r = webrms_next::parity::run(&pool, &cfg, tmp.path()).await;
+    assert!(r.is_err(), "parity without a live connector must refuse");
+}

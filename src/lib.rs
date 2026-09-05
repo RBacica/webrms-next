@@ -1,10 +1,13 @@
+pub mod backup;
 pub mod config;
 pub mod connector;
 pub mod db;
+pub mod doctor;
 pub mod fallback;
 pub mod files;
 pub mod ingest;
 pub mod modules;
+pub mod parity;
 pub mod poller;
 pub mod replication;
 pub mod server;

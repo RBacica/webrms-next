@@ -2742,6 +2742,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http-body-util",
+ "libc",
  "reqwest",
  "rust_xlsxwriter",
  "serde",

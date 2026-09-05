@@ -31,6 +31,8 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 arc-swap = "1"
+# statvfs for `doctor` disk check (unix only; no-op elsewhere).
+libc = "0.2"
 # Windows service (SCM-native, headless --service mode). Windows-only; no-op elsewhere.
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

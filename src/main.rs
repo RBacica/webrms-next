@@ -22,13 +22,22 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Full connector seed from a live system (P1).
+    /// Full connector seed from a live system (P1). Takes an automatic
+    /// pre-seed backup first (O-9) so a re-seed is always reversible.
     Seed {
         /// Connector source name (new-hos | old-hos | bos)
         source: String,
     },
-    /// Diagnostics: DB integrity, connector reachability, sync lag (P4).
+    /// Diagnostics: DB integrity, connector reachability, sync lag (B3).
     Doctor,
+    /// Backup data.db (VACUUM INTO) with keep-N retention (B2/O-9).
+    Backup {
+        /// Number of backups to keep (newest wins).
+        #[arg(long, default_value_t = 5)]
+        keep: usize,
+    },
+    /// Cutover gate: compare live AKPOS row counts vs the local DB (P4).
+    Parity,
 }
 
 #[derive(Subcommand)]
@@ -49,10 +58,62 @@ async fn main() -> anyhow::Result<()> {
         Commands::Service { action } => service(action).await,
         Commands::Seed { source } => seed(&source).await,
         Commands::Doctor => {
-            tracing::warn!("doctor not implemented until P4");
+            init_tracing();
+            let (cfg, _) = AppConfig::load()?;
+            let data_dir = cfg.data_dir_abs();
+            if !webrms_next::doctor::run(&cfg, &data_dir).await? {
+                std::process::exit(1);
+            }
             Ok(())
         }
+        Commands::Backup { keep } => {
+            let (cfg, _) = AppConfig::load()?;
+            let data_dir = cfg.data_dir_abs();
+            let keep = keep.max(1);
+            let path = webrms_next::backup::create_backup(&data_dir, keep).await?;
+            let bytes = webrms_next::backup::size_bytes(&path);
+            println!("✓ backup created: {} ({} bytes)", path.display(), bytes);
+            let kept = webrms_next::backup::list_backups(&data_dir);
+            println!("  backups kept ({keep}):");
+            for b in kept.iter().take(keep) {
+                println!("    {}  ({} bytes)", b.display(), webrms_next::backup::size_bytes(b));
+            }
+            Ok(())
+        }
+        Commands::Parity => parity().await,
     }
+}
+
+async fn parity() -> anyhow::Result<()> {
+    init_tracing();
+    let (cfg, _) = AppConfig::load()?;
+    let data_dir = cfg.data_dir_abs();
+    std::fs::create_dir_all(&data_dir)?;
+    let pool = webrms_next::db::init_pool(&data_dir).await?;
+
+    match webrms_next::parity::run(&pool, &cfg, &data_dir).await {
+        Ok((rows, clean)) => {
+            println!("\n  table              live      local      Δ");
+            println!("  {}", "-".repeat(40));
+            for r in &rows {
+                let delta = r.live - r.local;
+                let flag = if delta != 0 { "  <<<" } else { "" };
+                println!("  {:<18} {:>8} {:>8} {:>6}{}", r.table, r.live, r.local, delta, flag);
+            }
+            println!("  {}", "-".repeat(40));
+            if clean {
+                println!("  PARITY OK — local DB matches the live system (row counts).");
+            } else {
+                println!("  PARITY DRIFT — investigate the flagged rows before cutover.");
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            eprintln!("parity failed: {e}");
+            std::process::exit(2);
+        }
+    }
+    Ok(())
 }
 
 fn init_tracing() {
@@ -259,10 +320,16 @@ async fn seed(source: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let pool = webrms_next::db::init_pool(&data_dir).await?;
 
+    // O-9: never re-seed without a rollback point. VACUUM INTO the current
+    // DB first (works even when data.db doesn't exist yet — creates an
+    // empty backup, harmless; keep-N applies).
+    let backup = webrms_next::backup::create_backup(&data_dir, webrms_next::backup::DEFAULT_KEEP).await?;
+    println!("✓ pre-seed backup: {}", backup.display());
+
     let conn = webrms_next::connector::hos::HosConnector::new(cfg.database.connection_string);
     let conn = &conn;
 
-    println!("seeding from '{source}' → {}", data_dir.display());
+    println!("seeding from '{source}' → {}\n", data_dir.display());
     webrms_next::ingest::run_seed(&pool, conn, source).await?;
     println!("✓ seed complete");
     Ok(())
