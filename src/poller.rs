@@ -108,6 +108,7 @@ impl Poller {
         section!("stock", ingest::ingest_stock(&pool, c, src).await);
         section!("sales", ingest::ingest_sales(&pool, c, src).await);
         section!("sales_ext", ingest::ingest_sales_ext(&pool, c, src, false).await);
+        section!("basket", ingest::ingest_basket(&pool, c, src, false).await);
         section!("receipts", ingest::ingest_receipts(&pool, c, src).await);
 
         // incoming-PO lifecycle: flip waiting_import→pending_receipt→receipted

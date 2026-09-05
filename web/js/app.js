@@ -28,7 +28,7 @@ let SERVER = { mode: "standalone", branch: null, author: false };
 let currentView = "overview";
 // Bump APP_VER on every web/ deploy — it versions the dynamic view imports so
 // a browser can never run a stale cached view module against new HTML.
-const APP_VER = 6;
+const APP_VER = 7;
 
 async function loadMeta() {
   try {

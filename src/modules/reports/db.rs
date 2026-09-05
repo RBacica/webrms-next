@@ -68,6 +68,8 @@ pub struct TopMover {
     pub upc: String,
     pub name: String,
     pub dept: String,
+    pub parent_upc: Option<String>,
+    pub children: Vec<TopMover>,
     pub units: f64,
     pub net: f64,
 }
@@ -95,8 +97,12 @@ pub struct OverviewSales {
 pub struct OverviewStock {
     pub items: i64,        // distinct UPCs with a current stock row
     pub value: f64,        // Σ qty × cost
+    pub retail_value: f64, // Σ qty × price1
+    pub cost_value: f64,   // = value
+    pub gp_value: f64,     // retail − cost
     pub sellout_low: i64,  // items with sellout < 7 days (fast)
     pub stockout: i64,     // items with qty <= 0
+    pub low_stock: i64,    // items with 0 < qty <= 3
 }
 
 #[derive(Debug, serde::Serialize, Clone)]
@@ -104,11 +110,65 @@ pub struct OverviewResponse {
     pub as_of: String,
     pub branch: Option<i64>,
     pub sales: OverviewSales,
+    pub voids_today: VoidsSummary,
     pub stock: OverviewStock,
+    pub basket: OverviewBasket,
     /// scanback/rebate received in the window (app-only tracking, C2)
     pub scanback_received: f64,
     /// gross profit incl. scanback uplift, for the 7-day window
     pub gp_incl_scanback: f64,
+}
+
+#[derive(Debug, serde::Serialize, Clone, Default)]
+pub struct VoidsSummary {
+    pub count: i64,
+    pub value: f64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct OverviewBasket {
+    pub week7_avg: f64,             // avg net per transaction, trailing 7d
+    pub items_per_basket: f64,      // avg units per transaction, trailing 7d
+    pub depts: Vec<BasketDept>,     // line-level composition by department
+    pub dist: Vec<BasketBand>,      // basket-size distribution
+    pub weekday: Vec<WeekdayAvg>,   // avg basket by weekday, trailing 28d
+    pub peak_hours: Vec<PeakHour>,  // top net hours, trailing 7d
+    pub payments: Vec<PaymentShare>,// payment-media share, trailing 7d
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct BasketDept {
+    pub dept_id: String,
+    pub dept_name: String,
+    pub avg_net_per_basket: f64,
+    pub avg_units_per_basket: f64,
+    pub share_pct: f64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct BasketBand {
+    pub band: String,
+    pub txns: i64,
+    pub share_pct: f64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct WeekdayAvg {
+    pub dow: i32,
+    pub txns: i64,
+    pub avg_net: f64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct PeakHour {
+    pub hour: i32,
+    pub net: f64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct PaymentShare {
+    pub media: String,
+    pub share_pct: f64,
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -295,10 +355,12 @@ pub async fn overview(pool: &SqlitePool, branch: Option<i64>) -> anyhow::Result<
     let pct = |a: f64, b: f64| if b > 0.0 { Some((a - b) / b * 100.0) } else { None };
 
     // stock snapshot (latest per UPC across branches, or branch-scoped)
-    let (stock_items, stock_value, stockout) = {
+    let (stock_items, stock_value, stockout, retail_value, low_stock) = {
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT COUNT(*), CAST(COALESCE(SUM(x.qty * COALESCE(i.cost, 0)), 0) AS REAL), \
-                    SUM(CASE WHEN x.qty <= 0 THEN 1 ELSE 0 END) \
+                    SUM(CASE WHEN x.qty <= 0 THEN 1 ELSE 0 END), \
+                    CAST(COALESCE(SUM(x.qty * COALESCE(i.price1, 0)), 0) AS REAL), \
+                    SUM(CASE WHEN x.qty > 0 AND x.qty <= 3 THEN 1 ELSE 0 END) \
              FROM (SELECT upc, qty FROM stock_current",
         );
         if let Some(b) = branch {
@@ -306,13 +368,25 @@ pub async fn overview(pool: &SqlitePool, branch: Option<i64>) -> anyhow::Result<
         }
         qb.push(" GROUP BY upc, qty) x \
                  LEFT JOIN items i ON i.upc = x.upc");
-        let row: (i64, f64, i64) = qb.build_query_as().fetch_one(pool).await?;
+        let row: (i64, f64, i64, f64, i64) = qb.build_query_as().fetch_one(pool).await?;
         row
     };
 
-    // 7-day window for scanback + GP
+    // ── basket analytics (rollups from 0013/0014) ───────────────────────────
     let wk_from = f(today - chrono::Duration::days(6));
     let wk_to = f(today + chrono::Duration::days(1));
+    let mo_from = f(today - chrono::Duration::days(27));
+    let (wk_txns, wk_net, wk_units) = hourly_window(pool, &wk_from, &wk_to, branch).await?;
+    let week7_avg = if wk_txns > 0 { wk_net / wk_txns as f64 } else { 0.0 };
+    let items_per_basket = if wk_txns > 0 { wk_units / wk_txns as f64 } else { 0.0 };
+    let depts = basket_depts(pool, &wk_from, &wk_to, branch, wk_txns as f64).await?;
+    let dist = basket_bands(pool, &wk_from, &wk_to, branch).await?;
+    let weekday = weekday_curve(pool, &mo_from, &wk_to, branch).await?;
+    let peak_hours = peak_hours(pool, &wk_from, &wk_to, branch).await?;
+    let payments = payment_shares(pool, &wk_from, &wk_to, branch).await?;
+    let voids_today = voids_today(pool, &f(today), branch).await?;
+
+    // 7-day window for scanback + GP
     let (wk_gross, wk_cost, _) = sum_window(pool, &wk_from, &wk_to, branch).await?;
     let scanback = scanback_window(pool, &wk_from, &wk_to, branch).await?;
     let gp_incl_scanback = if wk_gross > 0.0 {
@@ -334,11 +408,25 @@ pub async fn overview(pool: &SqlitePool, branch: Option<i64>) -> anyhow::Result<
             today_vs_yesterday_pct: pct(t_today, t_yday),
             today_vs_last_week_pct: pct(t_today, t_lwsd),
         },
+        voids_today,
         stock: OverviewStock {
             items: stock_items,
             value: stock_value,
+            retail_value,
+            cost_value: stock_value,
+            gp_value: retail_value - stock_value,
             sellout_low: 0, // sellout needs forecast rates; filled by UI
             stockout,
+            low_stock,
+        },
+        basket: OverviewBasket {
+            week7_avg,
+            items_per_basket,
+            depts,
+            dist,
+            weekday,
+            peak_hours,
+            payments,
         },
         scanback_received: scanback,
         gp_incl_scanback,
@@ -372,7 +460,7 @@ pub async fn top_movers(
     qb.push(" GROUP BY sd.upc, i.description, d.name \
              ORDER BY SUM(sd.revenue) DESC LIMIT ").push_bind(limit);
     let rows: Vec<(String, String, String, f64, f64)> = qb.build_query_as().fetch_all(pool).await?;
-    Ok(rows.into_iter().map(|(upc, name, dept, units, net)| TopMover { upc, name, dept, units, net }).collect())
+    Ok(rows.into_iter().map(|(upc, name, dept, units, net)| TopMover { upc, name, dept, parent_upc: None, children: Vec::new(), units, net }).collect())
 }
 
 /// Dept movers: top 5 per department over the window.
@@ -410,7 +498,7 @@ pub async fn dept_movers(
             }
         };
         if bucket.movers.len() < 5 {
-            bucket.movers.push(TopMover { upc, name, dept: dept_name.clone(), units, net });
+            bucket.movers.push(TopMover { upc, name, dept: dept_name.clone(), parent_upc: None, children: Vec::new(), units, net });
         }
     }
     Ok(out)
@@ -799,4 +887,177 @@ pub async fn hourly_curve(pool: &SqlitePool, from: &str, to: &str, branch: Optio
         .fetch_all(pool).await?
     };
     Ok(rows.into_iter().map(|(hour, txns, net, stations)| HourlyRow { hour, txns, net, stations }).collect())
+}
+
+// ── Overview basket analytics helpers (rollups 0013/0014) ─────────────────────
+
+/// (txns, net, units) over sales_hourly + sales_daily in [from, to).
+async fn hourly_window(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>) -> anyhow::Result<(i64, f64, f64)> {
+    let (txns, net): (i64, f64) = if let Some(b) = branch {
+        sqlx::query_as("SELECT COALESCE(SUM(txns),0), CAST(COALESCE(SUM(net),0) AS REAL) FROM sales_hourly WHERE branch_id=?1 AND sale_date>=?2 AND sale_date<?3")
+            .bind(b).bind(from).bind(to).fetch_one(pool).await?
+    } else {
+        sqlx::query_as("SELECT COALESCE(SUM(txns),0), CAST(COALESCE(SUM(net),0) AS REAL) FROM sales_hourly WHERE sale_date>=?1 AND sale_date<?2")
+            .bind(from).bind(to).fetch_one(pool).await?
+    };
+    let units: f64 = if let Some(b) = branch {
+        sqlx::query_scalar("SELECT CAST(COALESCE(SUM(units),0) AS REAL) FROM sales_daily WHERE branch_id=?1 AND sale_date>=?2 AND sale_date<?3")
+            .bind(b).bind(from).bind(to).fetch_one(pool).await?
+    } else {
+        sqlx::query_scalar("SELECT CAST(COALESCE(SUM(units),0) AS REAL) FROM sales_daily WHERE sale_date>=?1 AND sale_date<?2")
+            .bind(from).bind(to).fetch_one(pool).await?
+    };
+    Ok((txns, net, units))
+}
+
+async fn basket_depts(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>, baskets: f64) -> anyhow::Result<Vec<BasketDept>> {
+    let rows: Vec<(String, String, f64, f64)> = if let Some(b) = branch {
+        sqlx::query_as(
+            "SELECT dept_id, dept_name, CAST(SUM(net) AS REAL), CAST(SUM(units) AS REAL) \
+             FROM sales_basket_dept WHERE branch_id=?1 AND sale_date>=?2 AND sale_date<?3 \
+             GROUP BY dept_id, dept_name ORDER BY SUM(net) DESC",
+        ).bind(b).bind(from).bind(to).fetch_all(pool).await?
+    } else {
+        sqlx::query_as(
+            "SELECT dept_id, dept_name, CAST(SUM(net) AS REAL), CAST(SUM(units) AS REAL) \
+             FROM sales_basket_dept WHERE sale_date>=?1 AND sale_date<?2 \
+             GROUP BY dept_id, dept_name ORDER BY SUM(net) DESC",
+        ).bind(from).bind(to).fetch_all(pool).await?
+    };
+    let total: f64 = rows.iter().map(|r| r.2).sum();
+    // top 8 departments, remainder rolled into "Other"
+    let mut out: Vec<BasketDept> = rows.iter().take(8).map(|(id, name, net, units)| BasketDept {
+        dept_id: id.clone(),
+        dept_name: name.clone(),
+        avg_net_per_basket: if baskets > 0.0 { net / baskets } else { 0.0 },
+        avg_units_per_basket: if baskets > 0.0 { units / baskets } else { 0.0 },
+        share_pct: if total > 0.0 { net / total * 100.0 } else { 0.0 },
+    }).collect();
+    if rows.len() > 8 {
+        let (r_net, r_units) = rows.iter().skip(8).fold((0.0f64, 0.0f64), |(a, b), r| (a + r.2, b + r.3));
+        out.push(BasketDept {
+            dept_id: "0".into(),
+            dept_name: "Other".into(),
+            avg_net_per_basket: if baskets > 0.0 { r_net / baskets } else { 0.0 },
+            avg_units_per_basket: if baskets > 0.0 { r_units / baskets } else { 0.0 },
+            share_pct: if total > 0.0 { r_net / total * 100.0 } else { 0.0 },
+        });
+    }
+    Ok(out)
+}
+
+async fn basket_bands(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>) -> anyhow::Result<Vec<BasketBand>> {
+    let rows: Vec<(String, i64)> = if let Some(b) = branch {
+        sqlx::query_as("SELECT band, SUM(txns) FROM sales_basket_band WHERE branch_id=?1 AND sale_date>=?2 AND sale_date<?3 GROUP BY band ORDER BY MIN(rowid)")
+            .bind(b).bind(from).bind(to).fetch_all(pool).await?
+    } else {
+        sqlx::query_as("SELECT band, SUM(txns) FROM sales_basket_band WHERE sale_date>=?1 AND sale_date<?2 GROUP BY band ORDER BY MIN(rowid)")
+            .bind(from).bind(to).fetch_all(pool).await?
+    };
+    let total: i64 = rows.iter().map(|r| r.1).sum();
+    Ok(rows.into_iter().map(|(band, txns)| BasketBand {
+        band,
+        txns,
+        share_pct: if total > 0 { txns as f64 / total as f64 * 100.0 } else { 0.0 },
+    }).collect())
+}
+
+async fn weekday_curve(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>) -> anyhow::Result<Vec<WeekdayAvg>> {
+    let rows: Vec<(i32, i64, f64)> = if let Some(b) = branch {
+        sqlx::query_as("SELECT dow, SUM(txns), CAST(SUM(net) AS REAL) FROM sales_hourly WHERE branch_id=?1 AND sale_date>=?2 AND sale_date<?3 GROUP BY dow ORDER BY dow")
+            .bind(b).bind(from).bind(to).fetch_all(pool).await?
+    } else {
+        sqlx::query_as("SELECT dow, SUM(txns), CAST(SUM(net) AS REAL) FROM sales_hourly WHERE sale_date>=?1 AND sale_date<?2 GROUP BY dow ORDER BY dow")
+            .bind(from).bind(to).fetch_all(pool).await?
+    };
+    Ok(rows.into_iter().map(|(dow, txns, net)| WeekdayAvg {
+        dow,
+        txns,
+        avg_net: if txns > 0 { net / txns as f64 } else { 0.0 },
+    }).collect())
+}
+
+async fn peak_hours(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>) -> anyhow::Result<Vec<PeakHour>> {
+    let rows: Vec<(i32, f64)> = if let Some(b) = branch {
+        sqlx::query_as("SELECT hour, CAST(SUM(net) AS REAL) FROM sales_hourly WHERE branch_id=?1 AND sale_date>=?2 AND sale_date<?3 GROUP BY hour ORDER BY SUM(net) DESC LIMIT 4")
+            .bind(b).bind(from).bind(to).fetch_all(pool).await?
+    } else {
+        sqlx::query_as("SELECT hour, CAST(SUM(net) AS REAL) FROM sales_hourly WHERE sale_date>=?1 AND sale_date<?2 GROUP BY hour ORDER BY SUM(net) DESC LIMIT 4")
+            .bind(from).bind(to).fetch_all(pool).await?
+    };
+    let mut v: Vec<PeakHour> = rows.into_iter().map(|(hour, net)| PeakHour { hour, net }).collect();
+    v.sort_by_key(|p| p.hour);
+    Ok(v)
+}
+
+async fn payment_shares(pool: &SqlitePool, from: &str, to: &str, branch: Option<i64>) -> anyhow::Result<Vec<PaymentShare>> {
+    let rows: Vec<(String, f64)> = if let Some(b) = branch {
+        sqlx::query_as("SELECT media, CAST(SUM(value) AS REAL) FROM sales_payment WHERE branch_id=?1 AND sale_date>=?2 AND sale_date<?3 GROUP BY media ORDER BY SUM(value) DESC")
+            .bind(b).bind(from).bind(to).fetch_all(pool).await?
+    } else {
+        sqlx::query_as("SELECT media, CAST(SUM(value) AS REAL) FROM sales_payment WHERE sale_date>=?1 AND sale_date<?2 GROUP BY media ORDER BY SUM(value) DESC")
+            .bind(from).bind(to).fetch_all(pool).await?
+    };
+    let total: f64 = rows.iter().map(|r| r.1).sum();
+    Ok(rows.into_iter().map(|(media, v)| PaymentShare {
+        media,
+        share_pct: if total > 0.0 { v / total * 100.0 } else { 0.0 },
+    }).collect())
+}
+
+async fn voids_today(pool: &SqlitePool, today: &str, branch: Option<i64>) -> anyhow::Result<VoidsSummary> {
+    let row: Option<(i64, f64)> = if let Some(b) = branch {
+        sqlx::query_as("SELECT SUM(count), CAST(COALESCE(SUM(value),0) AS REAL) FROM voids_daily WHERE branch_id=?1 AND sale_date=?2")
+            .bind(b).bind(today).fetch_optional(pool).await?
+    } else {
+        sqlx::query_as("SELECT SUM(count), CAST(COALESCE(SUM(value),0) AS REAL) FROM voids_daily WHERE sale_date=?1")
+            .bind(today).fetch_optional(pool).await?
+    };
+    Ok(match row {
+        Some((count, value)) => VoidsSummary { count, value },
+        None => VoidsSummary::default(),
+    })
+}
+
+// ── Overview: promo uplifts (trailing 30d) ───────────────────────────────────
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct PromoSummary {
+    pub measured: i64,
+    pub top: Vec<PromoUplift>,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct PromoUplift {
+    pub description: String,
+    pub net: f64,
+    pub units: f64,
+}
+
+pub async fn promo_summary(pool: &SqlitePool, from: &str, to: &str) -> anyhow::Result<PromoSummary> {
+    // Reuse the promotions RBP resolver: each active condition carries its
+    // resolved UPCs. Sum sales_daily net/units per condition in the window.
+    let conds = crate::modules::promotions::rbp::active_conditions(pool, None).await?;
+    let mut measured: i64 = 0;
+    let mut top: Vec<PromoUplift> = Vec::new();
+    for c in conds {
+        if c.upcs.is_empty() { continue; }
+        let mut qb = sqlx::QueryBuilder::new(
+            "SELECT CAST(COALESCE(SUM(sd.revenue),0) AS REAL), CAST(COALESCE(SUM(sd.units),0) AS REAL) \
+             FROM sales_daily sd WHERE sd.sale_date >= ",
+        );
+        qb.push_bind(from).push(" AND sd.sale_date < ").push_bind(to)
+          .push(" AND sd.upc IN (");
+        let mut sep = qb.separated(", ");
+        for u in &c.upcs { sep.push_bind(u); }
+        sep.push_unseparated(")");
+        let (net, units): (f64, f64) = qb.build_query_as().fetch_one(pool).await?;
+        if net > 0.0 || units > 0.0 {
+            measured += 1;
+            top.push(PromoUplift { description: c.description, net, units });
+        }
+    }
+    top.sort_by(|a, b| b.net.partial_cmp(&a.net).unwrap_or(std::cmp::Ordering::Equal));
+    top.truncate(3);
+    Ok(PromoSummary { measured, top })
 }

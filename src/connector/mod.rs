@@ -38,6 +38,9 @@ pub trait Connector: Send + Sync {
     async fn pull_payments(&self, branch_id: i32, since: &str) -> anyhow::Result<Vec<LivePayment>>;
     /// Hourly-curve rows for one branch from TransHeaders (since = YYYY-MM-DD).
     async fn pull_hourly(&self, branch_id: i32, since: &str) -> anyhow::Result<Vec<LiveHourly>>;
+    /// Basket analytics for one branch (dept composition + size bands + voids),
+    /// since = YYYY-MM-DD ('' = full history).
+    async fn pull_basket(&self, branch_id: i32, since: &str) -> anyhow::Result<LiveBasket>;
     async fn pull_sales(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveSaleLine>>;
     async fn pull_receipts(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveReceipt>>;
     async fn pull_ap(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveApInvoice>>;
@@ -96,6 +99,7 @@ pub struct LiveItem {
     pub supplier: Option<String>,
     pub parent_upc: Option<String>,
     pub supplier_prod_code: Option<String>,
+    pub disc_group: Option<String>,
     pub cost: f64,
     pub cost_ave: f64,
     pub purchase_cost: f64,
@@ -141,6 +145,36 @@ pub struct LiveHourly {
     pub station: i32,
     pub txns: i64,
     pub net: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveBasketDept {
+    pub sale_date: String,
+    pub dept_id: String,
+    pub dept_name: String,
+    pub net: f64,
+    pub units: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveBasketBand {
+    pub sale_date: String,
+    pub band: String,
+    pub txns: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveVoid {
+    pub sale_date: String,
+    pub count: i64,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LiveBasket {
+    pub depts: Vec<LiveBasketDept>,
+    pub bands: Vec<LiveBasketBand>,
+    pub voids: Vec<LiveVoid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

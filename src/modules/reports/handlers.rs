@@ -31,6 +31,7 @@ pub fn routes() -> axum::Router<SharedState> {
         .route("/api/reports/stocktakes", axum::routing::get(get_stocktakes))
         .route("/api/reports/payments", axum::routing::get(get_payments))
         .route("/api/reports/hourly", axum::routing::get(get_hourly))
+        .route("/api/reports/promo-summary", axum::routing::get(get_promo_summary))
 }
 
 #[derive(Deserialize)]
@@ -213,5 +214,21 @@ async fn get_hourly(
     match db::hourly_curve(&*state.pool_arc(), &from, &to, branch).await {
         Ok(rows) => (StatusCode::OK, Json(json!(rows))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Database error: {e}") }))),
+    }
+}
+
+async fn get_promo_summary(
+    State(state): State<SharedState>,
+    Query(query): Query<ReportQuery>,
+) -> impl IntoResponse {
+    let (Some(from), Some(to)) = (query.from.clone(), query.to.clone()) else {
+        return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
+    };
+    match db::promo_summary(&*state.pool_arc(), &from, &to).await {
+        Ok(s) => (StatusCode::OK, Json(json!(s))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
+        ),
     }
 }

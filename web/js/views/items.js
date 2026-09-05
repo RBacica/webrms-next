@@ -7,11 +7,24 @@ export async function render(el, { API, SERVER }) {
   el.innerHTML = `
   <div class="panel">
     <div class="toolbar" style="flex-wrap:wrap">
-      <input type="search" id="it-q" placeholder="Search UPC / SKU / description / barcode…" style="min-width:300px">
-      <label class="chk"><input type="checkbox" id="it-inactive"> include inactive</label>
+      <input type="search" id="it-q" placeholder="Search UPC / SKU / description / barcode…" style="min-width:280px">
       <button id="it-search" class="secondary">Search</button>
+      <label class="chk"><input type="checkbox" id="it-inactive"> include inactive</label>
+      <label class="chk"><input type="checkbox" id="it-nonstock"> non-stock</label>
       <div style="margin-left:auto"></div>
       <div id="it-editor" class="muted" style="font-size:13px"></div>
+    </div>
+    <div class="toolbar" style="flex-wrap:wrap;margin-top:8px">
+      <select id="it-dept" style="max-width:220px"><option value="">All departments</option></select>
+      <select id="it-sub" style="max-width:200px"><option value="">All sub-depts</option></select>
+      <select id="it-class" style="max-width:160px"><option value="">All classes</option></select>
+      <select id="it-supplier" style="max-width:240px"><option value="">All suppliers</option></select>
+      <select id="it-disc" style="max-width:140px"><option value="">All disc groups</option></select>
+      <select id="it-parent" style="max-width:170px">
+        <option value="">All items</option>
+        <option value="parent">Parent items only</option>
+        <option value="child">Child items only</option>
+      </select>
     </div>
     <div id="it-msg" class="msg"></div>
   </div>
@@ -21,20 +34,50 @@ export async function render(el, { API, SERVER }) {
   const msg = (t, c) => { $("it-msg").className = c ? `msg ${c}` : "msg"; $("it-msg").textContent = t; };
   let current = null;
 
+  // load filter facets
+  try {
+    const f = await API.get("/api/items/facets");
+    const fillSel = (id, opts, nameOf) => {
+      (opts || []).forEach((o) => {
+        const opt = document.createElement("option");
+        opt.value = o.id !== undefined ? String(o.id) : String(o);
+        opt.textContent = nameOf ? nameOf(o) : String(o);
+        $(id).appendChild(opt);
+      });
+    };
+    fillSel("it-dept", f.departments, (o) => o.name);
+    fillSel("it-sub", f.sub_departments);
+    fillSel("it-class", f.classes);
+    fillSel("it-supplier", f.suppliers, (o) => `${o.code} · ${o.name}`);
+    fillSel("it-disc", f.disc_groups);
+  } catch { /* facets are non-fatal */ }
+
   async function doSearch() {
     const q = $("it-q").value.trim();
     const incl = $("it-inactive").checked;
+    const ns = $("it-nonstock").checked;
+    const f = new URLSearchParams({ q });
+    if (incl) f.set("include_inactive", "true");
+    if (ns) f.set("non_stock", "true");
+    const dept = $("it-dept").value, sub = $("it-sub").value, cls = $("it-class").value,
+          sup = $("it-supplier").value, disc = $("it-disc").value, par = $("it-parent").value;
+    if (dept) f.set("department", dept);
+    if (sub) f.set("sub", sub);
+    if (cls) f.set("class", cls);
+    if (sup) f.set("supplier", sup);
+    if (disc) f.set("disc_group", disc);
+    if (par) f.set("parent", par);
     msg("Searching…");
     try {
-      const d = await API.get(`/api/items/search?q=${encodeURIComponent(q)}${incl ? "&include_inactive=true" : ""}`);
+      const d = await API.get(`/api/items/search?${f.toString()}`);
       const items = d.items || [];
       $("it-results").innerHTML = items.length
         ? `<div class="table-wrap"><table>
         <thead><tr><th>UPC</th><th>SKU</th><th>Description</th><th>Supplier</th><th class="num">Cost</th><th class="num">Price1</th><th>State</th><th></th></tr></thead>
         <tbody>${items.map((i) => `<tr data-upc="${esc(i.upc)}" class="${i.is_active ? "" : "row-inactive"}">
           <td class="muted">${esc(i.upc)}</td><td class="muted">${esc(i.sku || "")}</td>
-          <td>${esc(i.description || "")}${i.overridden ? ' <span class="badge-ish">edited</span>' : ""}</td>
-          <td class="muted">${esc(i.supplier_code || "")}</td>
+          <td>${esc(i.description || "")}${i.overridden ? ' <span class="badge-ish">edited</span>' : ""}${i.non_stock ? ' <span class="muted">(non-stock)</span>' : ""}</td>
+          <td class="muted">${esc(i.supplier_code || "")}${i.disc_group ? ` · DG ${esc(i.disc_group)}` : ""}</td>
           <td class="num">${i.cost}</td><td class="num">${i.price1}</td>
           <td>${i.is_active ? '<span class="ok">active</span>' : '<span class="muted">inactive</span>'}</td>
           <td class="num"><button class="secondary it-open">Edit</button></td>

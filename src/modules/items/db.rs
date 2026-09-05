@@ -27,6 +27,11 @@ pub struct ItemRow {
     pub price1: f64,
     pub pack_units: f64,
     pub department: Option<String>,
+    pub department_id: Option<i64>,
+    pub sub_department: Option<String>,
+    pub class: Option<String>,
+    pub disc_group: Option<String>,
+    pub non_stock: bool,
     pub is_active: bool,
     pub parent_upc: Option<String>,
     pub source: String,
@@ -40,48 +45,105 @@ pub const EDITABLE: &[&str] = &[
     "pack_units", "volume_ml", "tax_code", "parent_upc", "non_stock", "is_active",
 ];
 
-pub async fn search(
-    pool: &SqlitePool,
-    q: &str,
-    include_inactive: bool,
-    supplier: Option<&str>,
-) -> anyhow::Result<Vec<ItemRow>> {
+#[derive(Debug, Default, Clone)]
+pub struct SearchFilters<'a> {
+    pub q: &'a str,
+    pub include_inactive: bool,
+    pub supplier: Option<&'a str>,
+    pub department: Option<&'a str>,
+    pub sub: Option<&'a str>,
+    pub class: Option<&'a str>,
+    pub disc_group: Option<&'a str>,
+    pub parent: Option<&'a str>,   // "parent" | "child" | None
+    pub non_stock: Option<bool>,
+}
+
+pub async fn search(pool: &SqlitePool, f: &SearchFilters<'_>) -> anyhow::Result<Vec<ItemRow>> {
     let mut qb = sqlx::QueryBuilder::new(
-        "SELECT i.upc, i.sku, i.description, s.code, i.supplier_prod_code, \
-                CAST(COALESCE(i.cost,0) AS REAL), CAST(COALESCE(i.cost_ave,0) AS REAL), \
-                CAST(COALESCE(i.price1,0) AS REAL), CAST(COALESCE(i.pack_units,1) AS REAL), \
-                COALESCE(d.name, ''), i.is_active, i.parent_upc, i.source, \
-                EXISTS (SELECT 1 FROM app_overrides o WHERE o.entity_type='item' AND o.entity_key = i.upc) \
+        "SELECT i.upc, i.sku, i.description, s.code AS supplier_code, i.supplier_prod_code, \
+                CAST(COALESCE(i.cost,0) AS REAL) AS cost, CAST(COALESCE(i.cost_ave,0) AS REAL) AS cost_ave, \
+                CAST(COALESCE(i.price1,0) AS REAL) AS price1, CAST(COALESCE(i.pack_units,1) AS REAL) AS pack_units, \
+                COALESCE(d.name, '') AS department, i.department_id, i.sub_department, i.class, i.disc_group, \
+                i.non_stock, i.is_active, i.parent_upc, i.source, \
+                EXISTS (SELECT 1 FROM app_overrides o WHERE o.entity_type='item' AND o.entity_key = i.upc) AS overridden \
          FROM items i \
          LEFT JOIN suppliers s ON s.id = i.supplier_id \
          LEFT JOIN departments d ON d.id = i.department_id \
          WHERE 1=1",
     );
-    if !q.is_empty() {
-        qb.push(" AND (i.upc LIKE ").push_bind(format!("%{q}%"))
-            .push(" OR i.description LIKE ").push_bind(format!("%{q}%"))
-            .push(" OR i.sku LIKE ").push_bind(format!("%{q}%"))
+    if !f.q.is_empty() {
+        qb.push(" AND (i.upc LIKE ").push_bind(format!("%{}%", f.q))
+            .push(" OR i.description LIKE ").push_bind(format!("%{}%", f.q))
+            .push(" OR i.sku LIKE ").push_bind(format!("%{}%", f.q))
             .push(" OR EXISTS (SELECT 1 FROM item_barcodes ib WHERE ib.upc = i.upc AND ib.barcode LIKE ")
-            .push_bind(format!("%{q}%")).push("))");
+            .push_bind(format!("%{}%", f.q)).push("))");
     }
-    if let Some(sc) = supplier.filter(|s| !s.is_empty()) {
+    if let Some(sc) = f.supplier.filter(|s| !s.is_empty()) {
         qb.push(" AND s.code = ").push_bind(sc);
     }
-    if !include_inactive {
+    if let Some(d) = f.department.filter(|s| !s.is_empty()) {
+        qb.push(" AND CAST(i.department_id AS TEXT) = ").push_bind(d);
+    }
+    if let Some(s) = f.sub.filter(|s| !s.is_empty()) {
+        qb.push(" AND i.sub_department = ").push_bind(s);
+    }
+    if let Some(c) = f.class.filter(|s| !s.is_empty()) {
+        qb.push(" AND i.class = ").push_bind(c);
+    }
+    if let Some(dg) = f.disc_group.filter(|s| !s.is_empty()) {
+        qb.push(" AND i.disc_group = ").push_bind(dg);
+    }
+    if let Some(p) = f.parent {
+        match p {
+            "parent" => { qb.push(" AND i.parent_upc IS NULL AND EXISTS (SELECT 1 FROM items c WHERE c.parent_upc = i.upc)"); }
+            "child" => { qb.push(" AND i.parent_upc IS NOT NULL"); }
+            _ => {}
+        }
+    }
+    if let Some(ns) = f.non_stock {
+        qb.push(" AND i.non_stock = ").push_bind(if ns { 1 } else { 0 });
+    }
+    if !f.include_inactive {
         qb.push(" AND i.is_active = 1");
     }
     qb.push(" ORDER BY i.description LIMIT 300");
-    let rows: Vec<(String, Option<String>, Option<String>, Option<String>, Option<String>, f64, f64, f64, f64, String, i64, Option<String>, String, i64)> =
-        qb.build_query_as().fetch_all(pool).await?;
+    let rows: Vec<ItemSearchRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(|r| ItemRow {
-        upc: r.0, sku: r.1, description: r.2, supplier_code: r.3, supplier_prod_code: r.4,
-        cost: r.5, cost_ave: r.6, price1: r.7, pack_units: r.8, department: if r.9.is_empty() { None } else { Some(r.9) },
-        is_active: r.10 != 0, parent_upc: r.11, source: r.12, overridden: r.13 != 0,
+        upc: r.upc, sku: r.sku, description: r.description, supplier_code: r.supplier_code,
+        supplier_prod_code: r.supplier_prod_code,
+        cost: r.cost, cost_ave: r.cost_ave, price1: r.price1, pack_units: r.pack_units,
+        department: if r.department.is_empty() { None } else { Some(r.department) },
+        department_id: r.department_id, sub_department: r.sub_department, class: r.class, disc_group: r.disc_group,
+        non_stock: r.non_stock != 0, is_active: r.is_active != 0, parent_upc: r.parent_upc, source: r.source,
+        overridden: r.overridden != 0,
     }).collect())
 }
 
+#[derive(sqlx::FromRow)]
+struct ItemSearchRow {
+    upc: String,
+    sku: Option<String>,
+    description: Option<String>,
+    supplier_code: Option<String>,
+    supplier_prod_code: Option<String>,
+    cost: f64,
+    cost_ave: f64,
+    price1: f64,
+    pack_units: f64,
+    department: String,
+    department_id: Option<i64>,
+    sub_department: Option<String>,
+    class: Option<String>,
+    disc_group: Option<String>,
+    non_stock: i64,
+    is_active: i64,
+    parent_upc: Option<String>,
+    source: String,
+    overridden: i64,
+}
+
 pub async fn get(pool: &SqlitePool, upc: &str) -> anyhow::Result<Option<ItemRow>> {
-    Ok(search(pool, upc, true, None).await?.into_iter().find(|r| r.upc == upc))
+    Ok(search(pool, &SearchFilters { q: upc, include_inactive: true, ..Default::default() }).await?.into_iter().find(|r| r.upc == upc))
 }
 
 /// Apply an app edit to an existing item + record overrides + ETL export.
@@ -342,4 +404,52 @@ async fn record_export(
     .execute(&mut **tx).await?;
     let _ = install;
     Ok(())
+}
+
+// ── Facets for the items filter dropdowns ────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, Clone, Default)]
+pub struct Facets {
+    pub departments: Vec<FacetDept>,
+    pub sub_departments: Vec<String>,
+    pub classes: Vec<String>,
+    pub suppliers: Vec<FacetSupplier>,
+    pub disc_groups: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct FacetDept {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct FacetSupplier {
+    pub code: String,
+    pub name: String,
+}
+
+pub async fn facets(pool: &SqlitePool) -> anyhow::Result<Facets> {
+    let departments: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT d.id, COALESCE(d.name, '') FROM departments d JOIN items i ON i.department_id = d.id GROUP BY d.id ORDER BY d.name",
+    ).fetch_all(pool).await?;
+    let sub_departments: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT sub_department FROM items WHERE sub_department IS NOT NULL AND sub_department != '' ORDER BY 1",
+    ).fetch_all(pool).await?;
+    let classes: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT class FROM items WHERE class IS NOT NULL AND class != '' ORDER BY 1",
+    ).fetch_all(pool).await?;
+    let suppliers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT s.code, COALESCE(s.name, '') FROM suppliers s JOIN items i ON i.supplier_id = s.id GROUP BY s.code, s.name ORDER BY s.name",
+    ).fetch_all(pool).await?;
+    let disc_groups: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT disc_group FROM items WHERE disc_group IS NOT NULL AND disc_group != '' ORDER BY 1",
+    ).fetch_all(pool).await?;
+    Ok(Facets {
+        departments: departments.into_iter().map(|(id, name)| FacetDept { id, name }).collect(),
+        sub_departments,
+        classes,
+        suppliers: suppliers.into_iter().map(|(code, name)| FacetSupplier { code, name }).collect(),
+        disc_groups,
+    })
 }

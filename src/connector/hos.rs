@@ -221,7 +221,7 @@ impl Connector for HosConnector {
                     CAST(Price6 AS FLOAT), CAST(Price7 AS FLOAT), CAST(Price8 AS FLOAT), \
                     CAST(TaxNo AS INT), CAST(PurchaseQty AS FLOAT), \
                     NonStock, InActive, CONVERT(varchar(23), Updated, 121), \
-                    SupplierProdCode \
+                    SupplierProdCode, DiscGroup \
              FROM Items \
              {where_clause} \
              {order_clause}");
@@ -246,6 +246,7 @@ impl Connector for HosConnector {
                 supplier: gs(r, 6),
                 parent_upc: gs(r, 7),
                 supplier_prod_code: gs(r, 24),
+                disc_group: { let d = gi32(r, 25); if d != 0 { Some(d.to_string()) } else { None } },
                 cost: gf(r, 8),
                 cost_ave: gf(r, 9),
                 purchase_cost: gf(r, 10),
@@ -356,6 +357,81 @@ impl Connector for HosConnector {
             txns: gi(r, 4),
             net: gf(r, 5),
         }).collect())
+    }
+
+    async fn pull_basket(&self, branch_id: i32, since: &str) -> anyhow::Result<LiveBasket> {
+        let mut client = self.connect().await?;
+        let since_clause = if since.is_empty() {
+            String::new()
+        } else {
+            format!("AND th.Logged >= '{since}'")
+        };
+        // 1) Per-department line-level composition (net + units per day).
+        let sql_dept = format!(
+            "SELECT CONVERT(varchar(10), th.Logged, 120) AS D, \
+                    CAST(ISNULL(i.Department, 0) AS VARCHAR) AS DeptID, \
+                    ISNULL(d.Description, 'Unknown') AS DeptName, \
+                    CAST(ISNULL(SUM(tl.SubAfterTax), 0) AS FLOAT) AS Net, \
+                    CAST(ISNULL(SUM(CAST(tl.Quantity AS FLOAT)), 0) AS FLOAT) AS Units \
+             FROM TransLines tl \
+             JOIN TransHeaders th \
+               ON tl.TransNo = th.TransNo AND tl.Branch = th.Branch AND tl.Station = th.Station \
+             LEFT JOIN Items i ON i.UPC = tl.UPC \
+             LEFT JOIN Departments d ON d.ID = i.Department \
+             WHERE th.Branch = {branch_id} AND th.TransStatus = 'C' \
+               AND tl.LineType IN ('N','S') AND ISNULL(tl.IsVoided, 0) = 0 \
+               AND (d.Description IS NULL OR d.Description NOT IN ('Non Sales','EPay')) {since_clause} \
+             GROUP BY CONVERT(varchar(10), th.Logged, 120), i.Department, d.Description \
+             ORDER BY D, Net DESC");
+        // 2) Basket-size bands (per-txn TotalAfterTax).
+        let sql_band = format!(
+            "SELECT CONVERT(varchar(10), th.Logged, 120) AS D, \
+                    CASE WHEN th.TotalAfterTax < 10 THEN '<$10' \
+                         WHEN th.TotalAfterTax < 20 THEN '$10-20' \
+                         WHEN th.TotalAfterTax < 50 THEN '$20-50' \
+                         WHEN th.TotalAfterTax < 100 THEN '$50-100' \
+                         WHEN th.TotalAfterTax < 200 THEN '$100-200' \
+                         ELSE '$200+' END AS Band, COUNT(*) AS Txns \
+             FROM TransHeaders th \
+             WHERE th.Branch = {branch_id} AND th.TransStatus = 'C' \
+               AND th.TransType IN ('C','A','M') {since_clause} \
+             GROUP BY CONVERT(varchar(10), th.Logged, 120), \
+                      CASE WHEN th.TotalAfterTax < 10 THEN '<$10' \
+                           WHEN th.TotalAfterTax < 20 THEN '$10-20' \
+                           WHEN th.TotalAfterTax < 50 THEN '$20-50' \
+                           WHEN th.TotalAfterTax < 100 THEN '$50-100' \
+                           WHEN th.TotalAfterTax < 200 THEN '$100-200' \
+                           ELSE '$200+' END \
+             ORDER BY D, Band");
+        // 3) Voided transactions (TransStatus='V').
+        let sql_void = format!(
+            "SELECT CONVERT(varchar(10), th.Logged, 120) AS D, COUNT(*) AS Cnt, \
+                    CAST(ISNULL(SUM(th.TotalAfterTax), 0) AS FLOAT) AS Val \
+             FROM TransHeaders th \
+             WHERE th.Branch = {branch_id} AND th.TransStatus = 'V' {since_clause} \
+             GROUP BY CONVERT(varchar(10), th.Logged, 120) \
+             ORDER BY D");
+        let rows = query_rows(&mut client, &sql_dept).await?;
+        let depts = rows.iter().map(|r| LiveBasketDept {
+            sale_date: gstr(r, 0),
+            dept_id: gstr(r, 1),
+            dept_name: gstr(r, 2),
+            net: gf(r, 3),
+            units: gf(r, 4),
+        }).collect();
+        let rows = query_rows(&mut client, &sql_band).await?;
+        let bands = rows.iter().map(|r| LiveBasketBand {
+            sale_date: gstr(r, 0),
+            band: gstr(r, 1),
+            txns: gi(r, 2),
+        }).collect();
+        let rows = query_rows(&mut client, &sql_void).await?;
+        let voids = rows.iter().map(|r| LiveVoid {
+            sale_date: gstr(r, 0),
+            count: gi(r, 1),
+            value: gf(r, 2),
+        }).collect();
+        Ok(LiveBasket { depts, bands, voids })
     }
 
     async fn pull_sales(&self, hw: &HighWater, limit: i64) -> anyhow::Result<PullResult<LiveSaleLine>> {

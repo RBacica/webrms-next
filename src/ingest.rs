@@ -421,21 +421,22 @@ async fn upsert_item(
         ("tax_code", json!(live_tax)),
         ("non_stock", json!(it.non_stock)),
         ("is_active", json!(!it.inactive)),
+        ("disc_group", it.disc_group.as_ref().map(|d| json!(d)).unwrap_or(json!(null))),
     ];
 
     sqlx::query(
         "INSERT INTO items (upc, source, source_key, sku, description, department_id, supplier_id, \
-                parent_upc, supplier_prod_code, class, sub_department, cost, cost_ave, purchase_cost, \
+                parent_upc, supplier_prod_code, class, sub_department, disc_group, cost, cost_ave, purchase_cost, \
                 price1, price2, price3, price4, price5, price6, price7, price8, \
                 tax_code, pack_units, volume_ml, non_stock, is_active, last_synced_at) \
          VALUES (?1, ?2, ?1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, datetime('now')) \
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, datetime('now')) \
          ON CONFLICT(upc) DO UPDATE SET \
            source=excluded.source, source_key=excluded.source_key, sku=excluded.sku, \
            description=excluded.description, department_id=excluded.department_id, \
            supplier_id=excluded.supplier_id, parent_upc=excluded.parent_upc, \
            supplier_prod_code=excluded.supplier_prod_code, \
-           class=excluded.class, sub_department=excluded.sub_department, \
+           class=excluded.class, sub_department=excluded.sub_department, disc_group=excluded.disc_group, \
            cost=excluded.cost, cost_ave=excluded.cost_ave, purchase_cost=excluded.purchase_cost, \
            price1=excluded.price1, price2=excluded.price2, price3=excluded.price3, \
            price4=excluded.price4, price5=excluded.price5, price6=excluded.price6, \
@@ -449,6 +450,7 @@ async fn upsert_item(
     .bind(dept_id).bind(sup_id_eff).bind(&it.parent_upc)
     .bind(ov("supplier_prod_code", json!(it.supplier_prod_code)).as_str().map(|s| s.to_string()))
     .bind(it.class).bind(it.sub_department)
+    .bind(ov("disc_group", json!(it.disc_group)).as_str().map(|s| s.to_string()))
     .bind(ov("cost", json!(it.cost)).as_f64().unwrap_or(it.cost))
     .bind(ov("cost_ave", json!(it.cost_ave)).as_f64().unwrap_or(it.cost_ave))
     .bind(ov("purchase_cost", json!(it.purchase_cost)).as_f64().unwrap_or(it.purchase_cost))
@@ -544,7 +546,8 @@ pub async fn run_seed<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, source
     let rbp = ingest_rbp(pool, conn, source).await?;
 
     let ext = ingest_sales_ext(pool, conn, source, true).await?;
-    tracing::info!("=== seed complete: items={items} stock={stock} sales={sales} receipts={receipts} ap={ap} promos={promos} rbp={rbp} ext={ext} ===");
+    let basket = ingest_basket(pool, conn, source, true).await?;
+    tracing::info!("=== seed complete: items={items} stock={stock} sales={sales} receipts={receipts} ap={ap} promos={promos} rbp={rbp} ext={ext} basket={basket} ===");
     Ok(())
 }
 
@@ -589,5 +592,56 @@ pub async fn ingest_sales_ext<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C
         tx.commit().await?;
     }
     let _ = source;
+    Ok(total)
+}
+
+/// Basket analytics rollups (dept composition + size bands + voids). Full at
+/// seed, trailing 3 days per poll (date-keyed upserts, idempotent).
+pub async fn ingest_basket<C: Connector + ?Sized>(pool: &SqlitePool, conn: &C, _source: &str, full: bool) -> anyhow::Result<u64> {
+    let since = if full {
+        String::new()
+    } else {
+        (chrono::Local::now().date_naive() - chrono::Duration::days(2)).format("%Y-%m-%d").to_string()
+    };
+    let branch_ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM branches WHERE is_active = 1")
+        .fetch_all(pool).await?;
+    let mut total: u64 = 0;
+    for b in branch_ids {
+        let basket = conn.pull_basket(b, &since).await?;
+        let mut tx = pool.begin().await?;
+        for d in &basket.depts {
+            sqlx::query(
+                "INSERT INTO sales_basket_dept (branch_id, sale_date, dept_id, dept_name, net, units) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(branch_id, sale_date, dept_id) DO UPDATE SET \
+                   dept_name=excluded.dept_name, net=excluded.net, units=excluded.units",
+            )
+            .bind(b).bind(&d.sale_date).bind(&d.dept_id).bind(&d.dept_name)
+            .bind(d.net).bind(d.units)
+            .execute(&mut *tx).await?;
+            total += 1;
+        }
+        for band in &basket.bands {
+            sqlx::query(
+                "INSERT INTO sales_basket_band (branch_id, sale_date, band, txns) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(branch_id, sale_date, band) DO UPDATE SET txns=excluded.txns",
+            )
+            .bind(b).bind(&band.sale_date).bind(&band.band).bind(band.txns)
+            .execute(&mut *tx).await?;
+            total += 1;
+        }
+        for v in &basket.voids {
+            sqlx::query(
+                "INSERT INTO voids_daily (branch_id, sale_date, count, value) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(branch_id, sale_date) DO UPDATE SET count=excluded.count, value=excluded.value",
+            )
+            .bind(b).bind(&v.sale_date).bind(v.count).bind(v.value)
+            .execute(&mut *tx).await?;
+            total += 1;
+        }
+        tx.commit().await?;
+    }
     Ok(total)
 }

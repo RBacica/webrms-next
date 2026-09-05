@@ -19,6 +19,7 @@ use crate::state::SharedState;
 pub fn routes() -> axum::Router<SharedState> {
     axum::Router::new()
         .route("/api/items/search", axum::routing::get(search))
+        .route("/api/items/facets", axum::routing::get(facets))
         .route("/api/items/{upc}", axum::routing::get(get_one))
         .route("/api/items/edit", axum::routing::post(edit))
         .route("/api/items/clone", axum::routing::post(clone))
@@ -34,11 +35,41 @@ struct SearchQuery {
     include_inactive: bool,
     #[serde(default)]
     supplier: Option<String>,
+    #[serde(default)]
+    department: Option<String>,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    disc_group: Option<String>,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    non_stock: Option<bool>,
 }
 
 async fn search(State(state): State<SharedState>, Query(query): Query<SearchQuery>) -> impl IntoResponse {
-    match db::search(&*state.pool_arc(), &query.q, query.include_inactive, query.supplier.as_deref()).await {
+    let f = db::SearchFilters {
+        q: &query.q,
+        include_inactive: query.include_inactive,
+        supplier: query.supplier.as_deref(),
+        department: query.department.as_deref(),
+        sub: query.sub.as_deref(),
+        class: query.class.as_deref(),
+        disc_group: query.disc_group.as_deref(),
+        parent: query.parent.as_deref(),
+        non_stock: query.non_stock,
+    };
+    match db::search(&*state.pool_arc(), &f).await {
         Ok(items) => (StatusCode::OK, Json(json!({ "items": items }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("{e}") }))),
+    }
+}
+
+async fn facets(State(state): State<SharedState>) -> impl IntoResponse {
+    match db::facets(&*state.pool_arc()).await {
+        Ok(f) => (StatusCode::OK, Json(json!(f))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("{e}") }))),
     }
 }
