@@ -26,6 +26,9 @@ const VIEW_LABELS = {
 
 let SERVER = { mode: "standalone", branch: null, author: false };
 let currentView = "overview";
+// Bump APP_VER on every web/ deploy — it versions the dynamic view imports so
+// a browser can never run a stale cached view module against new HTML.
+const APP_VER = 6;
 
 async function loadMeta() {
   try {
@@ -104,7 +107,7 @@ async function route() {
   if (el._cleanup) { try { el._cleanup(); } catch (e) { /* ignore */ } el._cleanup = null; }
   el.innerHTML = '<div class="placeholder"><h2>Loading…</h2></div>';
   try {
-    const mod = await import(`./views/${v}.js`);
+    const mod = await import(`./views/${v}.js?v=${APP_VER}`);
     await mod.render(el, { API, SERVER });
   } catch (e) {
     el.innerHTML = `<div class="placeholder"><h2>View error</h2><p class="bad">${e.message}</p></div>`;
