@@ -1167,3 +1167,54 @@ async fn stocktake_export_records_run() {
     let (_, body2) = get(&app, "/api/reports/stocktakes").await;
     assert!(body2.contains("\"status\":\"exported\""), "run recorded: {body2}");
 }
+
+// ── Ordering sheet batching: branch-scoped vs all-branch semantics ──────────
+
+#[tokio::test]
+async fn order_sheet_batched_semantics_branch_and_all() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1,'HoS',1),(2,'BoS A',0),(3,'BoS B',0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1,'010','010','Tasman')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO items (id, upc, sku, description, supplier_id, cost, price1, is_active) \
+                 VALUES (1,'5010677014205','S1','Jameson 1L',1,40.0,59.99,1), \
+                        (2,'5010677025812','S2','Bacardi 1L',1,36.0,52.99,1)")
+        .execute(&pool).await.unwrap();
+    // stock: branch 2 and branch 3 both hold item 1; item 2 only branch 3
+    sqlx::query("INSERT INTO stock_current (branch_id, upc, qty, as_of) VALUES \
+                 (2,'5010677014205',4.0,'2026-09-05'),(3,'5010677014205',6.0,'2026-09-05'),\
+                 (3,'5010677025812',2.0,'2026-09-05')")
+        .execute(&pool).await.unwrap();
+    // sales: item 1 on branch 2 (3 units) + branch 3 (5 units) on the same day
+    sqlx::query("INSERT INTO sales_daily (branch_id, upc, sale_date, units, revenue, cost_amount, promo_units) VALUES \
+                 (2,'5010677014205','2026-08-20',3.0,150.0,90.0,0),(3,'5010677014205','2026-08-20',5.0,250.0,150.0,0)")
+        .execute(&pool).await.unwrap();
+    // an open order on branch 2 for item 1 → on-order 12
+    sqlx::query("INSERT INTO orders (id, origin_install, branch_id, supplier_id, placed_at, status, total_qty, total_cost) \
+                 VALUES ('ord-1','hos-1',2,1,'2026-09-05 10:00:00','open',12,480.0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO order_lines (id, order_id, upc, qty, unit_cost, line_total) \
+                 VALUES ('ol-1','ord-1','5010677014205',12,40.0,480.0)")
+        .execute(&pool).await.unwrap();
+
+    let lines = webrms_next::modules::ordering::db::order_sheet(&pool, "010", Some(2), true).await.unwrap();
+    assert_eq!(lines.len(), 2);
+    let j = lines.iter().find(|l| l.upc == "5010677014205").unwrap();
+    assert_eq!(j.on_hand, 4.0, "branch-scoped stock");
+    assert_eq!(j.on_order, 12.0, "branch-scoped on-order");
+    assert!(j.result.rate30 > 0.0, "branch-scoped history present (rate30 {})", j.result.rate30);
+
+    // all-branches: stock = latest row per upc (item 1 → one row, 4 or 6), on-order 0,
+    // history = SUM across branches (8 units on 2026-08-20)
+    let lines_all = webrms_next::modules::ordering::db::order_sheet(&pool, "010", None, true).await.unwrap();
+    let ja = lines_all.iter().find(|l| l.upc == "5010677014205").unwrap();
+    assert!(ja.on_hand == 4.0 || ja.on_hand == 6.0, "all-branch stock latest: {}", ja.on_hand);
+    assert_eq!(ja.on_order, 0.0, "no branch scope → on-order 0 (old behavior)");
+    assert!(
+        ja.result.rate30 > j.result.rate30,
+        "all-branch history sums across branches (was silently empty pre-fix): all rate30 {} vs branch2 rate30 {}",
+        ja.result.rate30, j.result.rate30
+    );
+}

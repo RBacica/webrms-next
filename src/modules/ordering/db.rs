@@ -126,64 +126,6 @@ pub async fn save_global_setting(pool: &SqlitePool, install: &str, key: &str, va
     Ok(())
 }
 
-/// Build the per-item sales history for the forecast from sales_daily.
-async fn product_history(
-    pool: &SqlitePool,
-    branch_id: i64,
-    upc: &str,
-) -> anyhow::Result<ProductHistory> {
-    // Daily units, last 92 days (offset 0 = today). Chrono date math.
-    let today = chrono::Local::now().date_naive();
-    let from = today - chrono::Duration::days(91);
-    let rows: Vec<(String, f64, f64)> = sqlx::query_as(
-        "SELECT sale_date, units, promo_units FROM sales_daily \
-         WHERE upc = ?1 AND branch_id = ?2 AND sale_date >= ?3 \
-         ORDER BY sale_date ASC",
-    )
-    .bind(upc)
-    .bind(branch_id)
-    .bind(from.format("%Y-%m-%d").to_string())
-    .fetch_all(pool)
-    .await?;
-
-    let mut daily: Vec<SaleDay> = Vec::new();
-    let mut promo_days: HashSet<i64> = HashSet::new();
-    for (date, units, promo_units) in rows {
-        if let Ok(d) = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
-            let offset = (d - today).num_days();
-            if offset <= 0 {
-                daily.push(SaleDay { offset, units });
-                if promo_units > 0.0 {
-                    promo_days.insert(offset);
-                }
-            }
-        }
-    }
-
-    // Upcoming promo windows (next 60 days) for this UPC.
-    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT effective_start, effective_end FROM promo_rules \
-         WHERE is_active = 1 AND sequence_match = ?1 \
-           AND (effective_end IS NULL OR effective_end >= ?2)",
-    )
-    .bind(upc)
-    .bind(today.format("%Y-%m-%d").to_string())
-    .fetch_all(pool)
-    .await?;
-    let mut upcoming_promos: Vec<(i64, i64)> = Vec::new();
-    for (s, e) in rows {
-        let s_d = s.as_deref().and_then(|x| chrono::NaiveDate::parse_from_str(x, "%Y-%m-%d").ok());
-        let e_d = e.as_deref().and_then(|x| chrono::NaiveDate::parse_from_str(x, "%Y-%m-%d").ok());
-        if let Some(sd) = s_d {
-            let start = (sd - today).num_days();
-            let end = e_d.map(|ed| (ed - today).num_days()).unwrap_or(60);
-            upcoming_promos.push((start.max(0), end.max(0)));
-        }
-    }
-
-    Ok(ProductHistory { daily, promo_days, upcoming_promos })
-}
-
 /// Active item-master + mode defaults for one supplier.
 pub struct ItemMeta {
     pub upc: String,
@@ -197,7 +139,14 @@ pub struct ItemMeta {
 }
 
 /// Build the order sheet for a supplier (optionally one branch).
-/// `branch = None` = all branches (uses latest-across-branches stock).
+/// `branch = None` = all branches (stock = latest row per UPC; sales history
+/// summed across branches — the per-branch-0 lookups of the old code made
+/// all-branch forecasts see zero history).
+///
+/// Batched (2026-09-05): the sheet used to run ~4 queries PER LINE (stock,
+/// on-order, sales history ×2) — ~1,800 round-trips for a 450-line supplier.
+/// Now the whole supplier loads in 4 fixed queries + 1 per 400-UPC chunk,
+/// and the per-line forecast loop is pure map lookups.
 pub async fn order_sheet(
     pool: &SqlitePool,
     supplier_code: &str,
@@ -233,28 +182,142 @@ pub async fn order_sheet(
     qb.push(" ORDER BY i.description");
     let items: Vec<(String, String, String, f64, f64, f64, bool, f64)> =
         qb.build_query_as().fetch_all(pool).await?;
+    let upcs: Vec<&str> = items.iter().map(|i| i.0.as_str()).collect();
 
-    let today_dow = chrono::Local::now().weekday().num_days_from_monday() as i64;
+    // ── batched lookups (one pass per table, chunked IN-lists) ──────────────
+    let today = chrono::Local::now().date_naive();
+    let today_dow = today.weekday().num_days_from_monday() as i64;
+
+    // stock
+    let stock = if let Some(b) = branch {
+        let mut m = std::collections::HashMap::new();
+        for chunk in upcs.chunks(400) {
+            let mut q = sqlx::QueryBuilder::new(
+                "SELECT upc, CAST(COALESCE(qty,0) AS REAL) FROM stock_current \
+                 WHERE branch_id = ",
+            );
+            q.push_bind(b).push(" AND upc IN (");
+            let mut sep = q.separated(", ");
+            for u in chunk {
+                sep.push_bind(*u);
+            }
+            q.push(")");
+            for (upc, qty) in q.build_query_as::<(String, f64)>().fetch_all(pool).await? {
+                m.insert(upc, qty);
+            }
+        }
+        m
+    } else {
+        // latest stock_current row per UPC (matches the old per-upc
+        // ORDER BY id DESC LIMIT 1)
+        let mut m = std::collections::HashMap::new();
+        for chunk in upcs.chunks(400) {
+            let mut q = sqlx::QueryBuilder::new(
+                "SELECT upc, CAST(qty AS REAL) FROM stock_current \
+                 WHERE id IN (SELECT MAX(id) FROM stock_current GROUP BY upc) AND upc IN (",
+            );
+            let mut sep = q.separated(", ");
+            for u in chunk {
+                sep.push_bind(*u);
+            }
+            q.push(")");
+            for (upc, qty) in q.build_query_as::<(String, f64)>().fetch_all(pool).await? {
+                m.insert(upc, qty);
+            }
+        }
+        m
+    };
+
+    // on-order (only meaningful branch-scoped; the old code returned 0 for
+    // branch=None)
+    let mut on_order: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    if let Some(b) = branch {
+        for chunk in upcs.chunks(400) {
+            let mut q = sqlx::QueryBuilder::new(
+                "SELECT ol.upc, CAST(COALESCE(SUM(ol.qty),0) AS REAL) \
+                 FROM order_lines ol JOIN orders o ON o.id = ol.order_id \
+                 WHERE o.branch_id = ",
+            );
+            q.push_bind(b)
+                .push(" AND o.status != 'cleared' AND ol.upc IN (");
+            let mut sep = q.separated(", ");
+            for u in chunk {
+                sep.push_bind(*u);
+            }
+            q.push(") GROUP BY ol.upc");
+            for (upc, qty) in q.build_query_as::<(String, f64)>().fetch_all(pool).await? {
+                on_order.insert(upc, qty);
+            }
+        }
+    }
+
+    // sales history (92 days): branch-scoped, or ALL branches summed per day
+    let from = (today - chrono::Duration::days(91)).format("%Y-%m-%d").to_string();
+    let mut sales_rows: Vec<(String, String, f64, f64)> = Vec::new();
+    for chunk in upcs.chunks(400) {
+        let mut q = sqlx::QueryBuilder::new(
+            "SELECT upc, sale_date, CAST(SUM(units) AS REAL), CAST(SUM(promo_units) AS REAL) \
+             FROM sales_daily \
+             WHERE sale_date >= ",
+        );
+        q.push_bind(&from);
+        if let Some(b) = branch {
+            q.push(" AND branch_id = ").push_bind(b);
+        }
+        q.push(" AND upc IN (");
+        let mut sep = q.separated(", ");
+        for u in chunk {
+            sep.push_bind(*u);
+        }
+        // GROUP BY collapses multi-branch rows per (upc, day) when branch=None
+        q.push(") GROUP BY upc, sale_date ORDER BY sale_date ASC");
+        sales_rows.extend(q.build_query_as::<(String, String, f64, f64)>().fetch_all(pool).await?);
+    }
+    // per-upc day rows (already one row per upc+day from the GROUP BY)
+    let mut daily_by_upc: std::collections::HashMap<String, Vec<(String, f64, f64)>> =
+        std::collections::HashMap::new();
+    for (upc, date, units, promo_units) in &sales_rows {
+        daily_by_upc
+            .entry(upc.clone())
+            .or_default()
+            .push((date.clone(), *units, *promo_units));
+    }
+
+    // promo windows (next 60 days) for this supplier's UPCs
+    let mut promo_by_upc: std::collections::HashMap<String, Vec<(Option<String>, Option<String>)>> =
+        std::collections::HashMap::new();
+    for chunk in upcs.chunks(400) {
+        let mut q = sqlx::QueryBuilder::new(
+            "SELECT sequence_match, effective_start, effective_end FROM promo_rules \
+             WHERE is_active = 1 AND (effective_end IS NULL OR effective_end >= ",
+        );
+        q.push_bind(today.format("%Y-%m-%d").to_string())
+            .push(") AND sequence_match IN (");
+        let mut sep = q.separated(", ");
+        for u in chunk {
+            sep.push_bind(*u);
+        }
+        q.push(")");
+        for (upc, s, e) in q
+            .build_query_as::<(String, Option<String>, Option<String>)>()
+            .fetch_all(pool)
+            .await?
+        {
+            promo_by_upc.entry(upc).or_default().push((s, e));
+        }
+    }
+
     let mut lines = Vec::new();
     for (upc, description, department, pack, min_qty, max_qty, no_order, cost) in items {
-        // stock: branch-scoped or latest-across-branches
-        let on_hand = match branch {
-            Some(b) => sqlx::query_scalar("SELECT qty FROM stock_current WHERE upc = ?1 AND branch_id = ?2")
-                .bind(&upc).bind(b).fetch_optional(pool).await?.unwrap_or(0.0),
-            None => sqlx::query_scalar(
-                "SELECT qty FROM stock_current WHERE upc = ?1 ORDER BY id DESC LIMIT 1",
-            )
-            .bind(&upc).fetch_optional(pool).await?.unwrap_or(0.0),
-        };
-        let on_order = match branch {
-            Some(b) => super::orders::active_on_order(pool, b, &upc).await?,
-            None => 0.0,
-        };
-        let hist = product_history(pool, branch.unwrap_or(0), &upc).await?;
+        let hist = assemble_history(
+            today,
+            daily_by_upc.get(&upc).map(|v| v.as_slice()).unwrap_or(&[]),
+            promo_by_upc.get(&upc).map(|v| v.as_slice()).unwrap_or(&[]),
+        );
         let cover = mode.cover_days.unwrap_or(mode.lead_days + mode.cycle_days);
         let inp = LineInput {
-            on_hand,
-            on_order,
+            on_hand: stock.get(&upc).copied().unwrap_or(0.0),
+            on_order: on_order.get(&upc).copied().unwrap_or(0.0),
             pack_size: pack,
             min_qty,
             max_qty,
@@ -273,8 +336,8 @@ pub async fn order_sheet(
             description,
             department,
             pack,
-            on_hand,
-            on_order,
+            on_hand: inp.on_hand,
+            on_order: inp.on_order,
             min_qty,
             max_qty,
             no_order,
@@ -283,4 +346,38 @@ pub async fn order_sheet(
         });
     }
     Ok(lines)
+}
+
+/// Pure assembly of a ProductHistory from raw daily-sales + promo-window rows.
+/// Extracted so the batched sheet path and any single-UPC caller share the
+/// exact same offset/promo-day semantics.
+fn assemble_history(
+    today: chrono::NaiveDate,
+    daily_rows: &[(String, f64, f64)], // (sale_date, units, promo_units)
+    promo_rows: &[(Option<String>, Option<String>)], // (start, end)
+) -> ProductHistory {
+    let mut daily: Vec<SaleDay> = Vec::new();
+    let mut promo_days: HashSet<i64> = HashSet::new();
+    for (date, units, promo_units) in daily_rows {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+            let offset = (d - today).num_days();
+            if offset <= 0 {
+                daily.push(SaleDay { offset, units: *units });
+                if *promo_units > 0.0 {
+                    promo_days.insert(offset);
+                }
+            }
+        }
+    }
+    let mut upcoming_promos: Vec<(i64, i64)> = Vec::new();
+    for (s, e) in promo_rows {
+        let s_d = s.as_deref().and_then(|x| chrono::NaiveDate::parse_from_str(x, "%Y-%m-%d").ok());
+        let e_d = e.as_deref().and_then(|x| chrono::NaiveDate::parse_from_str(x, "%Y-%m-%d").ok());
+        if let Some(sd) = s_d {
+            let start = (sd - today).num_days();
+            let end = e_d.map(|ed| (ed - today).num_days()).unwrap_or(60);
+            upcoming_promos.push((start.max(0), end.max(0)));
+        }
+    }
+    ProductHistory { daily, promo_days, upcoming_promos }
 }

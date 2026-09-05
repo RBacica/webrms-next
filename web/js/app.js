@@ -97,6 +97,11 @@ async function route() {
   currentView = v;
   nav();
   const el = document.getElementById("view");
+  // Cleanup contract: views register their intervals on el._timers so a
+  // navigation away never leaves a poller running (incoming.js was stacking
+  // one 60s interval per visit).
+  if (el._timers) { el._timers.forEach((t) => clearInterval(t)); el._timers = []; }
+  if (el._cleanup) { try { el._cleanup(); } catch (e) { /* ignore */ } el._cleanup = null; }
   el.innerHTML = '<div class="placeholder"><h2>Loading…</h2></div>';
   try {
     const mod = await import(`./views/${v}.js`);

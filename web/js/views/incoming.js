@@ -39,7 +39,9 @@ export async function render(el, { API, SERVER }) {
     }
   };
   load();
-  setInterval(load, 60000);
+  // register the poll interval with the router so it is cleared on nav away
+  el._timers = el._timers || [];
+  el._timers.push(setInterval(load, 60000));
 }
 
 function statusTag(s) {

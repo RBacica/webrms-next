@@ -297,16 +297,15 @@ pub async fn overview(pool: &SqlitePool, branch: Option<i64>) -> anyhow::Result<
     // stock snapshot (latest per UPC across branches, or branch-scoped)
     let (stock_items, stock_value, stockout) = {
         let mut qb = sqlx::QueryBuilder::new(
-            "SELECT COUNT(*), CAST(COALESCE(SUM(qty * cost), 0) AS REAL), \
-                    SUM(CASE WHEN qty <= 0 THEN 1 ELSE 0 END) \
-             FROM (SELECT upc, qty, \
-                          (SELECT COALESCE(cost, 0) FROM items i WHERE i.upc = sc.upc) AS cost \
-                   FROM stock_current sc",
+            "SELECT COUNT(*), CAST(COALESCE(SUM(x.qty * COALESCE(i.cost, 0)), 0) AS REAL), \
+                    SUM(CASE WHEN x.qty <= 0 THEN 1 ELSE 0 END) \
+             FROM (SELECT upc, qty FROM stock_current",
         );
         if let Some(b) = branch {
             qb.push(" WHERE branch_id = ").push_bind(b);
         }
-        qb.push(" GROUP BY upc, qty)");
+        qb.push(" GROUP BY upc, qty) x \
+                 LEFT JOIN items i ON i.upc = x.upc");
         let row: (i64, f64, i64) = qb.build_query_as().fetch_one(pool).await?;
         row
     };
