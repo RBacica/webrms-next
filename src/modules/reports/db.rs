@@ -486,3 +486,204 @@ pub async fn dept_weekly(pool: &SqlitePool, branch: Option<i64>) -> anyhow::Resu
     });
     Ok(out)
 }
+
+// ── R-parity ports (old WebRMS Reports view, over the local DB) ──────────────
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct StockProduct {
+    pub upc: String,
+    pub name: String,
+    pub subdept: String,
+    pub on_hand: f64,
+    pub price: f64,
+    pub retail_value: f64, // on_hand × price ÷ 1.15 (excl GST, matches old report)
+    pub cost_value: f64,
+    pub units_30: f64,
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct StockDept {
+    pub dept_name: String,
+    pub items: i64,
+    pub units: f64,
+    pub retail_value: f64,
+    pub cost_value: f64,
+    pub gp_value: f64,
+    pub products: Vec<StockProduct>,
+}
+
+/// R-stock: stock valuation by dept from stock_current × items.cost/price.
+/// branch = None aggregates all branches' on-hand per UPC.
+pub async fn stock_valuation(pool: &SqlitePool, branch: Option<i64>) -> anyhow::Result<Vec<StockDept>> {
+    // 30d units per upc (matches the old report's 30-day window)
+    let units30: std::collections::HashMap<String, f64> = sqlx::query_as::<_, (String, f64)>(
+        "SELECT upc, COALESCE(SUM(units),0) FROM sales_daily \
+         WHERE sale_date >= date('now','-30 days') GROUP BY upc",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
+
+    let items: Vec<(String, String, String, f64, f64, f64)> = if let Some(b) = branch {
+        sqlx::query_as(
+            "SELECT i.upc, COALESCE(i.description,''), COALESCE(d.name,''), \
+                    CAST(COALESCE(NULLIF(i.cost,0), i.cost_ave, i.purchase_cost, 0) AS REAL), \
+                    CAST(COALESCE(i.price1,0) AS REAL), \
+                    CAST(COALESCE(sc.qty,0) AS REAL) \
+             FROM items i \
+             LEFT JOIN departments d ON d.id = i.department_id \
+             LEFT JOIN stock_current sc ON sc.upc = i.upc AND sc.branch_id = ?1 \
+             WHERE i.is_active = 1 AND i.non_stock = 0 \
+               AND COALESCE(d.name,'') NOT IN ('Non Sales','EPay') \
+             ORDER BY d.name, i.description",
+        )
+        .bind(b)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT i.upc, COALESCE(i.description,''), COALESCE(d.name,''), \
+                    CAST(COALESCE(NULLIF(i.cost,0), i.cost_ave, i.purchase_cost, 0) AS REAL), \
+                    CAST(COALESCE(i.price1,0) AS REAL), \
+                    CAST(COALESCE((SELECT SUM(sc.qty) FROM stock_current sc WHERE sc.upc = i.upc),0) AS REAL) \
+             FROM items i \
+             LEFT JOIN departments d ON d.id = i.department_id \
+             WHERE i.is_active = 1 AND i.non_stock = 0 \
+               AND COALESCE(d.name,'') NOT IN ('Non Sales','EPay') \
+             ORDER BY d.name, i.description",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+
+    let mut depts: Vec<StockDept> = Vec::new();
+    let mut cur: Option<String> = None;
+    let mut products: Vec<StockProduct> = Vec::new();
+    for (upc, name, dept, cost, price, qty) in items {
+        if cur.as_deref() != Some(dept.as_str()) {
+            if let Some(c) = &cur {
+                finish_stock_dept(&mut depts, c, &mut products);
+            }
+            cur = Some(dept);
+        }
+        products.push(StockProduct {
+            upc: upc.clone(),
+            name,
+            subdept: String::new(),
+            on_hand: qty,
+            price,
+            retail_value: qty * price / 1.15,
+            cost_value: qty * cost,
+            units_30: units30.get(&upc).copied().unwrap_or(0.0),
+        });
+    }
+    if let Some(c) = &cur {
+        finish_stock_dept(&mut depts, c, &mut products);
+    }
+    Ok(depts)
+}
+
+fn finish_stock_dept(depts: &mut Vec<StockDept>, name: &str, products: &mut Vec<StockProduct>) {
+    let retail: f64 = products.iter().map(|p| p.retail_value).sum();
+    let cost: f64 = products.iter().map(|p| p.cost_value).sum();
+    depts.push(StockDept {
+        dept_name: name.to_string(),
+        items: products.len() as i64,
+        units: products.iter().map(|p| p.on_hand).sum(),
+        retail_value: retail,
+        cost_value: cost,
+        gp_value: retail - cost,
+        products: std::mem::take(products),
+    });
+}
+
+/// R-receipts: GRN ↔ AP reconciliation per supplier over a period.
+/// goods-in ('G') and returns ('Z') come from receipts; AP from ap_invoices.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct ReceiptRow {
+    pub supplier_code: String,
+    pub supplier_name: String,
+    pub goods_in: f64,     // total cost of 'G' receipts
+    pub returns: f64,      // 'Z' credit notes
+    pub net_grn: f64,      // goods_in − returns
+    pub ap_invoiced: f64,  // ap_invoices.invoice_amount in the window
+    pub variance: f64,     // ap_invoiced − net_grn
+}
+
+pub async fn receipts_report(
+    pool: &SqlitePool,
+    from: &str,
+    to: &str,
+    branch: Option<i64>,
+) -> anyhow::Result<Vec<ReceiptRow>> {
+    if let Some(_b) = branch {
+        // single-branch variant
+        let rows: Vec<(String, String, f64, f64, f64)> = sqlx::query_as(
+            "SELECT COALESCE(s.code,''), COALESCE(s.name,''), \
+                    CAST(COALESCE((SELECT SUM(total_cost) FROM receipts r WHERE r.supplier_id = s.id \
+                       AND r.trans_type = 'G' AND r.logged >= ?1 AND r.logged < date(?2,'+1 day') \
+                       AND r.branch_id = ?3),0) AS REAL), \
+                    CAST(COALESCE((SELECT SUM(total_cost) FROM receipts r WHERE r.supplier_id = s.id \
+                       AND r.trans_type = 'Z' AND r.logged >= ?1 AND r.logged < date(?2,'+1 day') \
+                       AND r.branch_id = ?3),0) AS REAL), \
+                    CAST(COALESCE((SELECT SUM(invoice_amount) FROM ap_invoices a WHERE a.supplier_id = s.id \
+                       AND a.invoice_date >= ?1 AND a.invoice_date < date(?2,'+1 day') \
+                       AND a.branch_id = ?3),0) AS REAL) \
+             FROM suppliers s WHERE s.is_active = 1 ORDER BY s.code",
+        )
+        .bind(from).bind(to).bind(_b)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|(c, n, g, z, a)| ReceiptRow {
+            supplier_code: c.clone(), supplier_name: n.clone(),
+            goods_in: g, returns: z, net_grn: g - z, ap_invoiced: a,
+            variance: a - (g - z),
+        }).collect())
+    } else {
+        let rows: Vec<(String, String, f64, f64, f64)> = sqlx::query_as(
+            "SELECT COALESCE(s.code,''), COALESCE(s.name,''), \
+                    CAST(COALESCE((SELECT SUM(total_cost) FROM receipts r WHERE r.supplier_id = s.id \
+                       AND r.trans_type = 'G' AND r.logged >= ?1 AND r.logged < date(?2,'+1 day')),0) AS REAL), \
+                    CAST(COALESCE((SELECT SUM(total_cost) FROM receipts r WHERE r.supplier_id = s.id \
+                       AND r.trans_type = 'Z' AND r.logged >= ?1 AND r.logged < date(?2,'+1 day')),0) AS REAL), \
+                    CAST(COALESCE((SELECT SUM(invoice_amount) FROM ap_invoices a WHERE a.supplier_id = s.id \
+                       AND a.invoice_date >= ?1 AND a.invoice_date < date(?2,'+1 day')),0) AS REAL) \
+             FROM suppliers s WHERE s.is_active = 1 ORDER BY s.code",
+        )
+        .bind(from).bind(to)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows.into_iter().map(|(c, n, g, z, a)| ReceiptRow {
+            supplier_code: c.clone(), supplier_name: n.clone(),
+            goods_in: g, returns: z, net_grn: g - z, ap_invoiced: a,
+            variance: a - (g - z),
+        }).collect())
+    }
+}
+
+/// R-stocktakes: stocktake export history from stocktake_runs (each export
+/// records a row). Costed variance (G-3) is a documented open item.
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct StocktakeRow {
+    pub id: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub status: String,
+    pub branch_id: Option<i64>,
+    pub count_file: Option<String>,
+    pub ticket_file: Option<String>,
+}
+
+pub async fn stocktakes_report(pool: &SqlitePool) -> anyhow::Result<Vec<StocktakeRow>> {
+    let rows: Vec<(String, String, Option<String>, String, Option<i64>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, started_at, completed_at, status, branch_id, count_file, ticket_file \
+             FROM stocktake_runs ORDER BY started_at DESC LIMIT 200",
+        )
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(id, s, c, st, b, cf, tf)| StocktakeRow {
+        id, started_at: s, completed_at: c, status: st, branch_id: b, count_file: cf, ticket_file: tf,
+    }).collect())
+}

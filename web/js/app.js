@@ -18,9 +18,9 @@ const API = {
   },
 };
 
-const VIEWS = ["overview", "ordering", "stocktake", "payables", "promotions", "incoming"];
+const VIEWS = ["overview", "reports", "ordering", "stocktake", "payables", "promotions", "incoming"];
 const VIEW_LABELS = {
-  overview: "Overview", ordering: "Ordering", stocktake: "Stocktake",
+  overview: "Overview", reports: "Reports", ordering: "Ordering", stocktake: "Stocktake",
   payables: "Payables", promotions: "Promotions", incoming: "Incoming PO",
 };
 

@@ -48,6 +48,84 @@ pub async fn supplier_mode(pool: &SqlitePool, code: &str) -> anyhow::Result<Supp
     })
 }
 
+/// Read a global boolean switch from the settings table ("true"/"1" = on).
+pub async fn global_flag(pool: &SqlitePool, key: &str) -> anyhow::Result<bool> {
+    let v: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(matches!(v.as_deref(), Some("true") | Some("1")))
+}
+
+/// Every supplier mode row (for the settings panel).
+pub async fn all_supplier_modes(pool: &SqlitePool) -> anyhow::Result<Vec<serde_json::Value>> {
+    let rows: Vec<(String, String, i64, Option<i64>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT supplier_code, mode, lead_days, cycle_days, cover_days, source \
+         FROM supplier_modes ORDER BY supplier_code",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(code, mode, lead, cycle, cover, source)| {
+            serde_json::json!({ "supplier_code": code, "mode": mode, "lead_days": lead,
+                                "cycle_days": cycle, "cover_days": cover, "source": source })
+        })
+        .collect())
+}
+
+/// Upsert one supplier's ordering mode + emit the outbox row (config-class,
+/// replicated down). App-authoritative: source = 'app'.
+pub async fn save_supplier_mode(
+    pool: &SqlitePool,
+    install: &str,
+    code: &str,
+    mode: &str,
+    lead_days: i64,
+    cycle_days: Option<i64>,
+    cover_days: Option<i64>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    sqlx::query(
+        "INSERT INTO supplier_modes (supplier_code, mode, lead_days, cycle_days, cover_days, source, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'app', ?6) \
+         ON CONFLICT(supplier_code) DO UPDATE SET mode=excluded.mode, lead_days=excluded.lead_days, \
+           cycle_days=excluded.cycle_days, cover_days=excluded.cover_days, source='app', updated_at=excluded.updated_at",
+    )
+    .bind(code).bind(mode).bind(lead_days).bind(cycle_days).bind(cover_days).bind(&now)
+    .execute(&mut *tx).await?;
+    let payload = serde_json::json!({
+        "supplier_code": code, "mode": mode, "lead_days": lead_days,
+        "cycle_days": cycle_days, "cover_days": cover_days, "source": "app", "updated_at": now,
+    });
+    crate::replication::emit(&mut tx, install, "supplier_modes", code, "insert", &payload).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Set one global ordering switch (whitelisted keys only) + emit outbox.
+pub async fn save_global_setting(pool: &SqlitePool, install: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    if !matches!(key, "ignore_min_qty" | "ignore_max_qty") {
+        anyhow::bail!("unknown setting key '{key}'");
+    }
+    if !matches!(value, "true" | "false") {
+        anyhow::bail!("value must be true|false");
+    }
+    let mut tx = pool.begin().await?;
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    sqlx::query(
+        "INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+    )
+    .bind(key).bind(value).bind(&now).bind(install)
+    .execute(&mut *tx).await?;
+    let payload = serde_json::json!({ "key": key, "value": value, "updated_at": now, "updated_by": install });
+    crate::replication::emit(&mut tx, install, "settings", key, "insert", &payload).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Build the per-item sales history for the forecast from sales_daily.
 async fn product_history(
     pool: &SqlitePool,
@@ -135,8 +213,9 @@ pub async fn order_sheet(
     };
     let mode = supplier_mode(pool, supplier_code).await?;
     let shrink: f64 = 0.0; // config later
-    let ignore_min = false;
-    let ignore_max = false;
+    // Global switches from the settings table (app-authored, replicated down).
+    let ignore_min = global_flag(pool, "ignore_min_qty").await?;
+    let ignore_max = global_flag(pool, "ignore_max_qty").await?;
 
     // Items for this supplier (active; optional InActive filter)
     let mut qb = sqlx::QueryBuilder::new(

@@ -24,6 +24,9 @@ pub fn routes() -> axum::Router<SharedState> {
         .route("/api/ordering/sheet", axum::routing::get(sheet))
         .route("/api/ordering/orders", axum::routing::get(list_orders).post(post_order))
         .route("/api/ordering/confirmation-csv", axum::routing::get(confirmation_csv))
+        .route("/api/ordering/settings", axum::routing::get(ordering_settings).post(save_ordering_settings))
+        .route("/api/ordering/modes", axum::routing::post(save_supplier_mode))
+        .route("/api/ordering/export", axum::routing::post(export_csv))
         .route("/api/sync/incoming-po", axum::routing::get(incoming_po).delete(delete_incoming_po))
 }
 
@@ -361,6 +364,208 @@ async fn delete_incoming_po(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Database error: {e}") })),
+        ),
+    }
+}
+
+// ── Ordering settings + modes + sheet export (old WebRMS parity) ─────────────
+
+/// GET /api/ordering/settings → global switches + every supplier mode.
+async fn ordering_settings(State(state): State<SharedState>) -> impl IntoResponse {
+    let pool = state.pool_arc();
+    let (imin, imax) = match (
+        db::global_flag(&*pool, "ignore_min_qty").await,
+        db::global_flag(&*pool, "ignore_max_qty").await,
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Database error: {e}") })),
+            );
+        }
+    };
+    match db::all_supplier_modes(&*pool).await {
+        Ok(modes) => (
+            StatusCode::OK,
+            Json(json!({
+                "ignore_min_qty": imin,
+                "ignore_max_qty": imax,
+                "modes": modes,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
+        ),
+    }
+}
+
+/// POST /api/ordering/settings — set the global switches (HoS/Remote-HoS only).
+#[derive(Deserialize)]
+struct GlobalSettingsBody {
+    #[serde(default)]
+    ignore_min_qty: Option<bool>,
+    #[serde(default)]
+    ignore_max_qty: Option<bool>,
+}
+
+async fn save_ordering_settings(
+    State(state): State<SharedState>,
+    Json(body): Json<GlobalSettingsBody>,
+) -> impl IntoResponse {
+    if !state.config_author() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Ordering settings are managed from the Head Office." })),
+        );
+    }
+    let install = state.cfg.sync.install_name.clone();
+    let mut wrote = 0u32;
+    let pool = state.pool_arc();
+    for (key, val) in [
+        ("ignore_min_qty", body.ignore_min_qty),
+        ("ignore_max_qty", body.ignore_max_qty),
+    ] {
+        if let Some(v) = val {
+            match db::save_global_setting(&*pool, &install, key, if v { "true" } else { "false" }).await {
+                Ok(()) => wrote += 1,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": format!("Failed to save {key}: {e}") })),
+                    );
+                }
+            }
+        }
+    }
+    crate::replication::notify_write(&state);
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "ok", "updated": wrote })),
+    )
+}
+
+/// POST /api/ordering/modes — per-supplier ordering mode (HoS/Remote-HoS only).
+#[derive(Deserialize)]
+struct SupplierModeBody {
+    supplier_code: String,
+    #[serde(default = "default_mode")]
+    mode: String,
+    #[serde(default = "default_lead")]
+    lead_days: i64,
+    cycle_days: Option<i64>,
+    cover_days: Option<i64>,
+}
+
+fn default_mode() -> String { "weekly".into() }
+fn default_lead() -> i64 { 3 }
+
+async fn save_supplier_mode(
+    State(state): State<SharedState>,
+    Json(body): Json<SupplierModeBody>,
+) -> impl IntoResponse {
+    if !state.config_author() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "Ordering modes are managed from the Head Office." })),
+        );
+    }
+    if body.supplier_code.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "supplier_code required" })));
+    }
+    let install = state.cfg.sync.install_name.clone();
+    match db::save_supplier_mode(
+        &*state.pool_arc(),
+        &install,
+        &body.supplier_code,
+        &body.mode,
+        body.lead_days.max(1),
+        body.cycle_days,
+        body.cover_days,
+    )
+    .await
+    {
+        Ok(()) => {
+            crate::replication::notify_write(&state);
+            (StatusCode::OK, Json(json!({ "status": "ok", "supplier_code": body.supplier_code })))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to save mode: {e}") })),
+        ),
+    }
+}
+
+/// POST /api/ordering/export — supplier-confirmation CSV of typed sheet lines,
+/// written to output/ordering/ (server copy) and returned for download.
+/// Body: { supplier, branch?, lines: [{ upc, qty }] }
+#[derive(Deserialize)]
+struct ExportBody {
+    supplier: String,
+    branch: Option<i64>,
+    lines: Vec<ExportLine>,
+}
+
+#[derive(Deserialize)]
+struct ExportLine {
+    upc: String,
+    qty: f64,
+}
+
+async fn export_csv(
+    State(state): State<SharedState>,
+    Json(body): Json<ExportBody>,
+) -> impl IntoResponse {
+    if body.supplier.is_empty() || body.lines.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "supplier and at least one line are required" })),
+        );
+    }
+    let pool = state.pool_arc();
+    let mut csv = String::from("Supplier,Branch,UPC,Description,Pack,OrderQty\n");
+    for l in &body.lines {
+        let (desc, pack): (Option<String>, Option<f64>) = sqlx::query_as(
+            "SELECT description, pack_units FROM items WHERE upc = ?1",
+        )
+        .bind(&l.upc)
+        .fetch_optional(&*pool)
+        .await
+        .map(|r| r.unwrap_or((None, None)))
+        .unwrap_or((None, None));
+        let desc = desc.unwrap_or_default().replace(',', " ").replace('\n', " ");
+        let pack = pack.unwrap_or(1.0);
+        csv.push_str(&format!(
+            "{},{},{},{},{},{}\n",
+            body.supplier,
+            body.branch.unwrap_or(0),
+            l.upc,
+            desc,
+            pack,
+            l.qty
+        ));
+    }
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let filename = format!("orders-{}-{ts}.csv", body.supplier);
+    let saved = crate::files::write_atomic(
+        &state.data_dir,
+        &format!("{}/ordering", crate::files::OUTPUT_DIR),
+        &filename,
+        csv.as_bytes(),
+    );
+    match saved {
+        Ok(path) => (
+            StatusCode::OK,
+            Json(json!({
+                "filename": filename,
+                "path": path.display().to_string(),
+                "content": csv,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to write export: {e}") })),
         ),
     }
 }

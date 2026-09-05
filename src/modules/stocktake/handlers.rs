@@ -179,6 +179,10 @@ async fn export_rows(
     let count_rows = result.count_rows;
     let ticket_rows = result.ticket_rows;
 
+    // Record the run (stocktake_runs) so the Reports → Stocktake & Shrink page
+    // has export history. Costed variance (G-3) is a documented open item.
+    let _ = record_run(&state, &result, &req).await;
+
     if destination == "client" {
         let mut files_out: Vec<serde_json::Value> = Vec::new();
         if let Some(p) = &result.count_path {
@@ -218,4 +222,31 @@ async fn export_rows(
             "ticket_rows": ticket_rows,
         })),
     )
+}
+
+/// Insert a stocktake_runs row after a successful export (branch from the
+/// request's branch field when present; best-effort).
+async fn record_run(
+    state: &crate::state::SharedState,
+    result: &exports::ExportResult,
+    req: &db::SaveRequest,
+) -> anyhow::Result<()> {
+    use uuid::Uuid;
+    // result.timestamp = "YYYY-MM-DD-HH-MM-SS" → store "YYYY-MM-DD HH:MM:SS"
+    let started_db = chrono::NaiveDateTime::parse_from_str(&result.timestamp, "%Y-%m-%d-%H-%M-%S")
+        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|_| result.timestamp.clone());
+    let branch_id = req.branch.map(|b| b as i64);
+    sqlx::query(
+        "INSERT INTO stocktake_runs (id, branch_id, started_at, status, count_file, ticket_file) \
+         VALUES (?1, ?2, ?3, 'exported', ?4, ?5)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(branch_id)
+    .bind(&started_db)
+    .bind(result.count_path.clone())
+    .bind(result.ticket_path.clone())
+    .execute(&*state.pool_arc())
+    .await?;
+    Ok(())
 }

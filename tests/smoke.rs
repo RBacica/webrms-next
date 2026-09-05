@@ -16,6 +16,24 @@ async fn test_app() -> (axum::Router, tempfile::TempDir) {
     (webrms_next::build_app(state), tmp)
 }
 
+async fn post(router: &axum::Router, uri: &str, body: &str) -> (StatusCode, String) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let resp_body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&resp_body).to_string())
+}
+
 async fn get(router: &axum::Router, uri: &str) -> (StatusCode, String) {
     let resp = router
         .clone()
@@ -1013,4 +1031,139 @@ async fn health_reports_replication_lag_for_client() {
     let (app2, _tmp2) = test_app().await;
     let (_, body2) = get(&app2, "/api/health").await;
     assert!(body2.contains("\"role\":\"source\""), "source role reported: {body2}");
+}
+
+
+// ── P4-parity: ordering settings/modes/export + reports stock/receipts/stocktakes ─
+
+#[tokio::test]
+async fn ordering_settings_and_modes_roundtrip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman')")
+        .execute(&pool).await.unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "hos".into();
+    cfg.sync.install_name = "hos-1".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state);
+
+    let (st, body) = post(&app, "/api/ordering/settings", r#"{"ignore_min_qty":true}"#).await;
+    assert_eq!(st, StatusCode::OK, "global settings save: {body}");
+    let (st, body) = get(&app, "/api/ordering/settings").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body.contains("\"ignore_min_qty\":true"), "settings reflect: {body}");
+
+    let (st, body) = post(&app, "/api/ordering/modes",
+        r#"{"supplier_code":"010","mode":"monthly","lead_days":5,"cycle_days":30,"cover_days":35}"#).await;
+    assert_eq!(st, StatusCode::OK, "mode save: {body}");
+    let (_, body) = get(&app, "/api/ordering/settings").await;
+    assert!(body.contains("\"supplier_code\":\"010\""), "modes listed: {body}");
+    assert!(body.contains("\"mode\":\"monthly\""), "monthly persisted: {body}");
+}
+
+#[tokio::test]
+async fn ordering_settings_writes_forbidden_on_bos() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "bos".into();
+    cfg.sync.install_name = "bos-1".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state);
+    let (st, body) = post(&app, "/api/ordering/settings", r#"{"ignore_min_qty":true}"#).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "BoS must not author settings: {body}");
+    let (st, _) = post(&app, "/api/ordering/modes", r#"{"supplier_code":"010"}"#).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn ordering_export_csv_writes_server_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO items (id, upc, sku, description, cost, price1, pack_units, is_active) \
+                 VALUES (1, '5010677014205', 'S1', 'Jameson 1L', 40.0, 59.99, 1, 1)")
+        .execute(&pool).await.unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "hos".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state);
+    let (st, body) = post(&app, "/api/ordering/export",
+        r#"{"supplier":"010","lines":[{"upc":"5010677014205","qty":12}]}"#).await;
+    assert_eq!(st, StatusCode::OK, "export: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["content"].as_str().unwrap().contains("Supplier,Branch,UPC,Description,Pack,OrderQty"), "{body}");
+    assert!(v["content"].as_str().unwrap().contains("010,0,5010677014205,Jameson 1L,1,12"), "{body}");
+    assert!(v["path"].as_str().unwrap().contains("orders-010-"), "server copy path: {body}");
+}
+
+#[tokio::test]
+async fn reports_stock_receipts_stocktakes_over_local_db() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'BoS', 0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO departments (id, name, target_margin) VALUES (60, 'Spirits', 25.0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO items (id, upc, sku, description, department_id, supplier_id, cost, price1, non_stock, is_active) \
+                 VALUES (1, '5010677014205', 'S1', 'Jameson 1L', 60, 1, 40.0, 59.99, 0, 1)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO stock_current (branch_id, upc, qty, as_of) VALUES (2, '5010677014205', 10.0, '2026-09-05')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO sales_daily (branch_id, upc, sale_date, units, revenue, cost_amount) \
+                 VALUES (2, '5010677014205', '2026-08-20', 4.0, 200.0, 120.0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, total_cost, logged) \
+                 VALUES (2, 100, 1, 'G', 1, 400.0, '2026-08-15 10:00:00')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO receipts (branch_id, trans_no, station, trans_type, supplier_id, total_cost, logged) \
+                 VALUES (2, 101, 1, 'Z', 1, 50.0, '2026-08-16 10:00:00')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO ap_invoices (branch_id, supplier_id, invoice_number, invoice_date, invoice_amount) \
+                 VALUES (2, 1, 'INV-1', '2026-08-15', 350.0)")
+        .execute(&pool).await.unwrap();
+
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "hos".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state);
+
+    // stock valuation: 10 × $40 cost = $400; retail 10 × 59.99/1.15
+    let (st, body) = get(&app, "/api/reports/stock?branch=2").await;
+    assert_eq!(st, StatusCode::OK, "stock: {body}");
+    assert!(body.contains("\"cost_value\":400.0"), "cost value: {body}");
+    assert!(body.contains("\"units_30\":4.0"), "30d units: {body}");
+
+    // GRN↔AP: goods 400 − returns 50 = net 350 vs AP 350 → variance 0
+    let (st, body) = get(&app, "/api/reports/receipts?from=2026-08-01&to=2026-08-31&branch=2").await;
+    assert_eq!(st, StatusCode::OK, "receipts: {body}");
+    assert!(body.contains("\"goods_in\":400.0") && body.contains("\"returns\":50.0")
+        && body.contains("\"variance\":0.0"), "GRN↔AP: {body}");
+
+    // stocktakes: no runs yet
+    let (st, body) = get(&app, "/api/reports/stocktakes").await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(body.contains("[]"), "no runs yet: {body}");
+}
+
+#[tokio::test]
+async fn stocktake_export_records_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (2, 'BoS', 0)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO items (id, upc, sku, description, cost, price1, is_active) \
+                 VALUES (1, '5010677014205', 'S1', 'Jameson 1L', 40.0, 59.99, 1)")
+        .execute(&pool).await.unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "bos".into();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state);
+    let (st, body) = post(&app, "/api/stocktake/export",
+        r#"{"destination":"server","branch":2,"rows":[{"upc":"5010677014205","description":"Jameson 1L","stock_on_hand":8,"count":7,"variance":1}]}"#).await;
+    assert_eq!(st, StatusCode::OK, "export: {body}");
+    let (_, body2) = get(&app, "/api/reports/stocktakes").await;
+    assert!(body2.contains("\"status\":\"exported\""), "run recorded: {body2}");
 }

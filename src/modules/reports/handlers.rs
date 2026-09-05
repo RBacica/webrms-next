@@ -26,6 +26,9 @@ pub fn routes() -> axum::Router<SharedState> {
         .route("/api/reports/overview/movers", axum::routing::get(get_movers))
         .route("/api/reports/overview/dept-movers", axum::routing::get(get_dept_movers))
         .route("/api/reports/overview/dept-weekly", axum::routing::get(get_dept_weekly))
+        .route("/api/reports/stock", axum::routing::get(get_stock))
+        .route("/api/reports/receipts", axum::routing::get(get_receipts))
+        .route("/api/reports/stocktakes", axum::routing::get(get_stocktakes))
 }
 
 #[derive(Deserialize)]
@@ -129,6 +132,50 @@ async fn get_dept_weekly(
 ) -> impl IntoResponse {
     let branch = effective_branch(&state, query.branch).map(|b| b as i64);
     match db::dept_weekly(&*state.pool_arc(), branch).await {
+        Ok(rows) => (StatusCode::OK, Json(json!(rows))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
+        ),
+    }
+}
+
+// ── R-parity handlers: stock valuation / GRN↔AP receipts / stocktakes ────────
+
+async fn get_stock(
+    State(state): State<SharedState>,
+    Query(query): Query<ReportQuery>,
+) -> impl IntoResponse {
+    // BoS is locked to its local branch; HoS: ?branch= or omitted = ALL.
+    let branch = effective_branch(&state, query.branch).map(|b| b as i64);
+    match db::stock_valuation(&*state.pool_arc(), branch).await {
+        Ok(depts) => (StatusCode::OK, Json(json!(depts))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
+        ),
+    }
+}
+
+async fn get_receipts(
+    State(state): State<SharedState>,
+    Query(query): Query<ReportQuery>,
+) -> impl IntoResponse {
+    let (Some(from), Some(to)) = (query.from.clone(), query.to.clone()) else {
+        return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
+    };
+    let branch = effective_branch(&state, query.branch).map(|b| b as i64);
+    match db::receipts_report(&*state.pool_arc(), &from, &to, branch).await {
+        Ok(rows) => (StatusCode::OK, Json(json!(rows))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Database error: {e}") })),
+        ),
+    }
+}
+
+async fn get_stocktakes(State(state): State<SharedState>) -> impl IntoResponse {
+    match db::stocktakes_report(&*state.pool_arc()).await {
         Ok(rows) => (StatusCode::OK, Json(json!(rows))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

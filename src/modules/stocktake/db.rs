@@ -111,6 +111,9 @@ pub struct SaveRequest {
     pub rows: Vec<SaveRow>,
     /// "server" | "client"
     pub destination: String,
+    /// Branch this count belongs to (when the UI knows it).
+    #[serde(default)]
+    pub branch: Option<i64>,
 }
 
 // ── queries over the local SQLite schema ───────────────────────────────────
