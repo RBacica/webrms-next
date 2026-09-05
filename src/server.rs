@@ -5,6 +5,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
+use axum::http::HeaderValue;
 
 use crate::db;
 use crate::replication;
@@ -14,8 +16,15 @@ use crate::state::{ServerInfo, ServerMode, SharedState};
 pub fn build_router(state: SharedState) -> Router {
     // Static UI: web/ served from the working directory (same layout as the
     // old WebRMS — run-* dirs bundle web/ next to the binary). SPA fallback
-    // for / and any non-API path.
-    let assets = ServeDir::new("web").not_found_service(ServeFile::new("web/index.html"));
+    // for / and any non-API path. ServeDir is wrapped in its own Router so we
+    // can attach no-cache (a plain ServeDir service has no .layer); without it
+    // the browser caches ./views/*.js modules between deploys.
+    let assets = Router::new()
+        .fallback_service(ServeDir::new("web").not_found_service(ServeFile::new("web/index.html")))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ));
 
     Router::new()
         .route("/api/health", get(health))
