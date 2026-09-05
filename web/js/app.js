@@ -47,11 +47,36 @@ async function loadMeta() {
 }
 
 async function refreshSyncStatus() {
+  const el = document.getElementById("sync-status");
   try {
-    const s = await API.get("/api/sync/status");
-    const el = document.getElementById("sync-status");
-    el.textContent = `sync: ${s.enabled ? `on · tick ${s.tick_count}` : "off"}`;
-  } catch { /* standalone — no sync */ }
+    const h = await API.get("/api/health");
+    let txt = "";
+    // connector freshness
+    if (h.connector === "ok") txt = `connector ok`;
+    else if (h.connector === "error") txt = `connector ERROR`;
+    else txt = `connector off`;
+    if (h.connector_age_secs !== null && h.connector_age_secs !== undefined && h.connector !== "disabled") {
+      const a = h.connector_age_secs;
+      const s = a < 90 ? `${a}s` : a < 5400 ? `${Math.round(a / 60)}m` : `${Math.round(a / 3600)}h`;
+      txt += ` · poll ${s} ago`;
+    }
+    // replication lag (sync clients)
+    if (h.replication && h.replication.role === "client") {
+      const lag = h.replication.lag_minutes;
+      if (lag === null) txt += ` · repl: never`;
+      else if (lag < 1) txt += ` · repl <1m`;
+      else if (lag < 60) txt += ` · repl ${lag}m`;
+      else txt += ` · repl ${Math.round(lag / 60)}h`;
+    }
+    // fallback engagement badge
+    if (h.fallback && h.fallback.engaged) {
+      txt += ` · SNAPSHOT MODE`;
+      el.className = "bad";
+    } else {
+      el.className = txt.includes("ERROR") ? "bad" : "ok";
+    }
+    el.textContent = txt;
+  } catch { el.textContent = "sync: ?"; }
 }
 
 function nav() {

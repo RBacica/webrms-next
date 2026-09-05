@@ -46,6 +46,8 @@ enum ServiceAction {
     Start,
     Stop,
     Remove,
+    /// (Internal) service entrypoint — launched by the SCM with `service run`.
+    Run,
 }
 
 #[tokio::main]
@@ -143,6 +145,14 @@ async fn init() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
+    run_until(shutdown_signal()).await
+}
+
+/// Full server boot (config → pool → poller → replication → bind → serve)
+/// with an externally-provided graceful-shutdown future. The console path
+/// passes ctrl-c/SIGTERM (run()); the Windows service passes a future that
+/// resolves when the SCM sends STOP (svc::run_service).
+async fn run_until(shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> anyhow::Result<()> {
     init_tracing();
     let (cfg, _cfg_path) = AppConfig::load()?;
     let data_dir = cfg.data_dir_abs();
@@ -192,7 +202,7 @@ async fn run() -> anyhow::Result<()> {
     tracing::info!("WebRMS-Next listening on http://{addr} (mode={})", cfg.role.mode);
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await
         .context("server error")
 }
@@ -224,11 +234,19 @@ mod svc {
     use anyhow::Context;
 
     const SERVICE_NAME: &str = "WebRMS-Next";
+    use windows_service::service::{ServiceState, ServiceStatus};
 
     pub async fn install() -> anyhow::Result<()> {
         let exe = std::env::current_exe().context("current_exe")?;
-        windows_service::service_manager::ServiceManager::local_computer(None::<&str>, windows_service::service_manager::ServiceManagerAccess::CreateService)
-            .context("open service manager")?
+        let manager_access = windows_service::service_manager::ServiceManagerAccess::CONNECT
+            | windows_service::service_manager::ServiceManagerAccess::CREATE_SERVICE;
+        let service_manager = windows_service::service_manager::ServiceManager::local_computer(None::<&str>, manager_access)
+            .context("open service manager")?;
+        let service_access = windows_service::service::ServiceAccess::QUERY_CONFIG
+            | windows_service::service::ServiceAccess::CHANGE_CONFIG
+            | windows_service::service::ServiceAccess::START
+            | windows_service::service::ServiceAccess::DELETE;
+        let service = service_manager
             .create_service(
                 &windows_service::service::ServiceInfo {
                     name: SERVICE_NAME.into(),
@@ -242,17 +260,38 @@ mod svc {
                     account_name: None,
                     account_password: None,
                 },
-                windows_service::service_manager::ServiceManagerAccess::CreateService,
+                service_access,
             )
             .context("create service")?;
+
+        // B6 self-recovery: SCM failure actions (restart 1s → 10s → 30s,
+        // reset after 24h) so a crashed service comes back on its own.
+        use windows_service::service::{
+            ServiceAction, ServiceActionType, ServiceFailureActions, ServiceFailureResetPeriod,
+        };
+        use std::time::Duration;
+        let actions = vec![
+            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(1) },
+            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(10) },
+            ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(30) },
+        ];
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(86400)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(actions),
+        })?;
+        let _ = service.set_failure_actions_on_non_crash_failures(true);
+        println!("✓ SCM recovery actions set (restart 1s→10s→30s, reset 24h)");
         println!("✓ service '{SERVICE_NAME}' installed (auto-start)");
         Ok(())
     }
 
     pub async fn start() -> anyhow::Result<()> {
-        windows_service::service_manager::ServiceManager::local_computer(None::<&str>, windows_service::service_manager::ServiceManagerAccess::Connect)
+        use windows_service::service::ServiceAccess;
+        windows_service::service_manager::ServiceManager::local_computer(None::<&str>, windows_service::service_manager::ServiceManagerAccess::CONNECT)
             .context("open service manager")?
-            .open_service(SERVICE_NAME, windows_service::service_manager::ServiceManagerAccess::StartService)
+            .open_service(SERVICE_NAME, ServiceAccess::START)
             .context("open service")?
             .start(&[] as &[String])
             .context("start service")?;
@@ -261,18 +300,19 @@ mod svc {
     }
 
     pub async fn stop() -> anyhow::Result<()> {
-        use windows_service::service::{ServiceControl, ServiceControlAccess};
-        let mgr = windows_service::service_manager::ServiceManager::local_computer(None::<&str>, windows_service::service_manager::ServiceManagerAccess::Connect)?;
-        let svc = mgr.open_service(SERVICE_NAME, windows_service::service_manager::ServiceManagerAccess::StopService)?;
+        use windows_service::service::ServiceAccess;
+        let mgr = windows_service::service_manager::ServiceManager::local_computer(None::<&str>, windows_service::service_manager::ServiceManagerAccess::CONNECT)?;
+        let svc = mgr.open_service(SERVICE_NAME, ServiceAccess::STOP)?;
         let status = svc.stop()?;
         println!("✓ service stopping ({:?})", status.current_state);
         Ok(())
     }
 
     pub async fn remove() -> anyhow::Result<()> {
-        windows_service::service_manager::ServiceManager::local_computer(None::<&str>, windows_service::service_manager::ServiceManagerAccess::Connect)
+        use windows_service::service::ServiceAccess;
+        windows_service::service_manager::ServiceManager::local_computer(None::<&str>, windows_service::service_manager::ServiceManagerAccess::CONNECT)
             .context("open service manager")?
-            .open_service(SERVICE_NAME, windows_service::service_manager::ServiceManagerAccess::Delete)
+            .open_service(SERVICE_NAME, ServiceAccess::DELETE)
             .context("open service")?
             .delete()
             .context("delete service")?;
@@ -280,13 +320,77 @@ mod svc {
         Ok(())
     }
 
-    /// P5: full SCM event loop with recovery actions (1s→10s→30s, reset 24h).
-    /// For now the service entry delegates to the same server path as `run`.
-    /// A real implementation registers a ServiceMain + control handler; the
-    /// server itself is already headless-safe (tracing→file, no console).
-    #[allow(dead_code)] // P5 entrypoint; not yet wired to a CLI action
     pub async fn run_service() -> anyhow::Result<()> {
-        crate::run().await
+        // The SCM launches the exe with `service run`. Block this thread in
+        // the dispatcher until the service is stopped (StartServiceCtrlDispatcher
+        // returns only when every service in the table has stopped).
+        windows_service::service_dispatcher::start(SERVICE_NAME, service_main)
+            .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"))?;
+        Ok(())
+    }
+
+    /// SCM entrypoint (extern "system", runs on an SCM thread): build a tokio
+    /// runtime, register the control handler, and drive the server until STOP.
+    /// No console, no pause_before_exit — headless by construction.
+    extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
+        let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(_) => return, // cannot even build a runtime — SCM will mark failed
+        };
+        let _ = rt.block_on(run_service_event_loop());
+    }
+
+    async fn run_service_event_loop() -> anyhow::Result<()> {
+        use tokio::sync::mpsc;
+        use windows_service::service::ServiceControl;
+        use windows_service::service_control_handler::{
+            register as register_handler, ServiceControlHandlerResult,
+        };
+
+        // Control events arrive on an SCM thread — forward STOP/SHUTDOWN into
+        // the async runtime via a channel.
+        let (tx, mut rx) = mpsc::channel::<ServiceControl>(4);
+        let handler = register_handler(SERVICE_NAME, move |control| match control {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                let _ = tx.try_send(control);
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NoError,
+        })?;
+
+        // Announce RUNNING (accepting stop) before doing any work — the SCM
+        // watchdog expects a status within ~30s of service_main starting.
+        handler.set_service_status(service_status(ServiceState::Running))?;
+
+        // Run the full server (config → pool → poller → replication → serve).
+        // Graceful shutdown fires when the channel delivers STOP/SHUTDOWN.
+        let stop = async move {
+            while let Some(c) = rx.recv().await {
+                if matches!(c, ServiceControl::Stop | ServiceControl::Shutdown) {
+                    break;
+                }
+            }
+        };
+        let result = crate::run_until(stop).await;
+
+        // Report the final state so the SCM doesn't wait out the watchdog.
+        let _ = handler.set_service_status(service_status(ServiceState::Stopped));
+        result
+    }
+
+    fn service_status(state: ServiceState) -> ServiceStatus {
+        use windows_service::service::{
+            ServiceControlAccept, ServiceExitCode, ServiceStatus, ServiceType,
+        };
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: ServiceControlAccept::STOP,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: std::time::Duration::default(),
+            process_id: None,
+        }
     }
 }
 
@@ -298,6 +402,7 @@ mod svc {
     pub async fn start() -> anyhow::Result<()> { anyhow::bail!("service start is Windows-only") }
     pub async fn stop() -> anyhow::Result<()> { anyhow::bail!("service stop is Windows-only") }
     pub async fn remove() -> anyhow::Result<()> { anyhow::bail!("service remove is Windows-only") }
+    pub async fn run_service() -> anyhow::Result<()> { anyhow::bail!("service run is Windows-only") }
 }
 
 async fn service(action: ServiceAction) -> anyhow::Result<()> {
@@ -306,6 +411,7 @@ async fn service(action: ServiceAction) -> anyhow::Result<()> {
         ServiceAction::Start => svc::start().await,
         ServiceAction::Stop => svc::stop().await,
         ServiceAction::Remove => svc::remove().await,
+        ServiceAction::Run => svc::run_service().await,
     }
 }
 

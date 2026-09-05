@@ -988,3 +988,29 @@ async fn parity_requires_live_connector() {
     let r = webrms_next::parity::run(&pool, &cfg, tmp.path()).await;
     assert!(r.is_err(), "parity without a live connector must refuse");
 }
+
+// ── D3: health reports replication lag for sync clients ──────────────────────
+
+#[tokio::test]
+async fn health_reports_replication_lag_for_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = webrms_next::db::init_pool(tmp.path()).await.unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "bos".into();
+    cfg.sync.enabled = true;
+    cfg.sync.source = "http://127.0.0.1:1".into();
+    cfg.sync.install_name = "bos-2".into();
+    sqlx::query("INSERT INTO sync_watermarks (source, last_ts, last_id, updated_at) \
+                 VALUES ('http://127.0.0.1:1', '2026-09-05 10:00:00', 'x', datetime('now'))")
+        .execute(&pool).await.unwrap();
+    let state = AppState::new(pool, cfg, tmp.path().to_path_buf());
+    let app = webrms_next::build_app(state);
+    let (status, body) = get(&app, "/api/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("\"role\":\"client\""), "client role reported: {body}");
+    assert!(body.contains("lag_minutes"), "lag field present: {body}");
+    // HoS (source) must report role=source, not client
+    let (app2, _tmp2) = test_app().await;
+    let (_, body2) = get(&app2, "/api/health").await;
+    assert!(body2.contains("\"role\":\"source\""), "source role reported: {body2}");
+}

@@ -412,13 +412,18 @@ async fn watermark(pool: &SqlitePool, source: &str) -> anyhow::Result<(String, S
 }
 
 async fn set_watermark(pool: &SqlitePool, source: &str, ts: &str, id: &str) -> anyhow::Result<()> {
+    // Store updated_at in LOCAL time (matches every other timestamp the app
+    // writes: PollStatus, fallback.json, sync_log pre-2026-09-05 rows use
+    // datetime('now') = UTC — lag readers parse %Y-%m-%d %H:%M:%S as local,
+    // so a UTC row reads exactly NZST-behind (720 min). Fix at the write site.
+    let now_local = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     sqlx::query(
         "INSERT INTO sync_watermarks (source, last_ts, last_id, updated_at) \
-         VALUES (?1, ?2, ?3, datetime('now')) \
+         VALUES (?1, ?2, ?3, ?4) \
          ON CONFLICT(source) DO UPDATE SET last_ts = excluded.last_ts, \
            last_id = excluded.last_id, updated_at = excluded.updated_at",
     )
-    .bind(source).bind(ts).bind(id)
+    .bind(source).bind(ts).bind(id).bind(&now_local)
     .execute(pool).await?;
     Ok(())
 }

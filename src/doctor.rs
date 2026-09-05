@@ -235,6 +235,7 @@ fn lag_minutes(ts: &str) -> i64 {
 }
 
 /// Disk free for the data dir (unix statvfs; windows reports 0 = unchecked).
+#[allow(unused_variables)]
 fn disk_free_mb(data_dir: &Path) -> Option<u64> {
     #[cfg(unix)]
     {

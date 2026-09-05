@@ -51,17 +51,47 @@ fn info(state: &SharedState) -> ServerInfo {
 }
 
 async fn health(State(state): State<SharedState>) -> impl IntoResponse {
-    let db_ok = db::ping(&*state.pool_arc()).await;
+    let db_ok = db::ping(&state.pool_arc()).await;
     let info = info(&state);
     let poll = state.poller.read().map(|p| p.as_ref().map(|h| h.status())).unwrap_or(None);
-    let (connector, last_poll) = match &poll {
-        Some(st) => (
-            if st.last_error.is_some() { "error".to_string() } else { "ok".to_string() },
-            st.last_success.clone(),
-        ),
-        None => ("disabled".to_string(), None),
+    let (connector, last_poll, connector_age_secs) = match &poll {
+        Some(st) => {
+            let age = st.last_success.as_deref().and_then(|ts| {
+                chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                    .ok()
+                    .map(|t| chrono::Local::now().naive_local().signed_duration_since(t).num_seconds().max(0))
+            });
+            (
+                if st.last_error.is_some() { "error".to_string() } else { "ok".to_string() },
+                st.last_success.clone(),
+                age,
+            )
+        }
+        None => ("disabled".to_string(), None, None),
     };
     let fb = crate::fallback::read_state(&state.data_dir);
+    // D3: replication lag for sync clients — age of the last successful pull
+    // from the source (sync_watermarks). The HoS is the source → disabled.
+    let replication = if state.cfg.sync.enabled && !state.cfg.sync.source.is_empty() {
+        let pool = state.pool_arc();
+        match sqlx::query_scalar::<_, String>(
+            "SELECT MAX(updated_at) FROM sync_watermarks WHERE source = ?1",
+        )
+        .bind(&state.cfg.sync.source)
+        .fetch_optional(&*pool)
+        .await
+        {
+            Ok(Some(ts)) => {
+                let mins = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S")
+                    .map(|t| chrono::Local::now().naive_local().signed_duration_since(t).num_minutes().max(0))
+                    .unwrap_or(-1);
+                json!({ "role": "client", "last_pull": ts, "lag_minutes": mins })
+            }
+            _ => json!({ "role": "client", "last_pull": null, "lag_minutes": null }),
+        }
+    } else {
+        json!({ "role": "source", "last_pull": null, "lag_minutes": null })
+    };
     (
         StatusCode::OK,
         Json(json!({
@@ -70,6 +100,7 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
             "mode": info.mode.as_str(),
             "connector": connector,
             "last_poll": last_poll,
+            "connector_age_secs": connector_age_secs,
             "fallback": {
                 "enabled": state.cfg.sync.fallback_enabled,
                 "engaged": fb.engaged,
@@ -82,7 +113,7 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
                 "attempts": fb.attempts,
             },
             "snapshot": if fb.engaged { "fallback-active" } else { "available" },
-            "replication": "n/a", // replication-lag plumbing: P4 (D3 badges)
+            "replication": replication,
             "version": env!("CARGO_PKG_VERSION"),
         })),
     )
