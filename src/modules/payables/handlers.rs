@@ -44,7 +44,7 @@ fn is_bos(state: &SharedState) -> bool {
 }
 
 async fn get_suppliers(State(state): State<SharedState>) -> impl IntoResponse {
-    match db::get_suppliers(&state.pool).await {
+    match db::get_suppliers(&*state.pool_arc()).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -54,7 +54,7 @@ async fn get_suppliers(State(state): State<SharedState>) -> impl IntoResponse {
 }
 
 async fn get_branches(State(state): State<SharedState>) -> impl IntoResponse {
-    match db::get_branches(&state.pool).await {
+    match db::get_branches(&*state.pool_arc()).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -77,7 +77,7 @@ async fn get_invoices(
     }
     let branch = effective_branch(&state, query.branch.as_deref().and_then(|b| b.parse::<i32>().ok()))
         .map(|b| b as i64);
-    match db::get_bills(&state.pool, &from, &to, branch, query.supplier.as_deref()).await {
+    match db::get_bills(&*state.pool_arc(), &from, &to, branch, query.supplier.as_deref()).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -100,7 +100,7 @@ async fn get_returns(
     }
     let branch = effective_branch(&state, query.branch.as_deref().and_then(|b| b.parse::<i32>().ok()))
         .map(|b| b as i64);
-    match db::get_returns(&state.pool, &from, &to, branch, query.supplier.as_deref()).await {
+    match db::get_returns(&*state.pool_arc(), &from, &to, branch, query.supplier.as_deref()).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -110,7 +110,7 @@ async fn get_returns(
 }
 
 async fn get_config(State(state): State<SharedState>) -> impl IntoResponse {
-    match db::get_config(&state.pool).await {
+    match db::get_config(&*state.pool_arc()).await {
         Ok(list) => (StatusCode::OK, Json(json!({ "suppliers": list }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -139,7 +139,7 @@ async fn save_config(
         );
     }
     match db::save_one(
-        &state.pool,
+        &*state.pool_arc(),
         &body.supplier_code,
         &body.term_type,
         body.term_days,
@@ -185,7 +185,7 @@ async fn save_config_bulk(
         let term_days = s["term_days"].as_i64();
         let order_type = s["order_type"].as_str().unwrap_or("").to_string();
         let payment_type = s["payment_type"].as_str().unwrap_or("").to_string();
-        if db::save_one(&state.pool, &code, &term_type, term_days, &order_type, &payment_type, &state.cfg.sync.install_name)
+        if db::save_one(&*state.pool_arc(), &code, &term_type, term_days, &order_type, &payment_type, &state.cfg.sync.install_name)
             .await
             .is_ok()
         {
@@ -197,7 +197,7 @@ async fn save_config_bulk(
 }
 
 async fn get_paid(State(state): State<SharedState>) -> impl IntoResponse {
-    match db::get_paid(&state.pool).await {
+    match db::get_paid(&*state.pool_arc()).await {
         Ok(keys) => (StatusCode::OK, Json(json!({ "paid": keys }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -232,7 +232,7 @@ async fn mark_paid(
             Json(json!({ "status": "error", "message": "No invoices selected to mark as paid" })),
         );
     }
-    match db::mark_paid(&state.pool, &rows, &state.cfg.sync.install_name).await {
+    match db::mark_paid(&*state.pool_arc(), &rows, &state.cfg.sync.install_name).await {
         Ok(added) => {
             crate::replication::notify_write(&state);
             (

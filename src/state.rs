@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use sqlx::sqlite::SqlitePool;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -45,12 +46,22 @@ pub struct ServerInfo {
 
 /// Shared application state.
 pub struct AppState {
-    pub pool: SqlitePool,
+    /// Live DB pool handle. ArcSwap so the snapshot fallback (fallback.rs)
+    /// can hot-swap to a restored data.db: every caller re-loads the current
+    /// pool via `pool_arc()`, so no code holds a stale handle across a swap.
+    pub pool: ArcSwap<SqlitePool>,
     pub cfg: AppConfig,
     pub data_dir: PathBuf,
     pub server_info: RwLock<ServerInfo>,
     /// Connector poller (None when sync/connector disabled — standalone mode).
     pub poller: RwLock<Option<crate::poller::PollerHandle>>,
+}
+
+impl AppState {
+    /// Load the current live pool (atomic; safe to call after a fallback swap).
+    pub fn pool_arc(&self) -> Arc<SqlitePool> {
+        Arc::clone(&self.pool.load_full())
+    }
 }
 
 /// Poll status reported by the connector loop (for /api/health + UI badges).
@@ -75,7 +86,7 @@ impl AppState {
             version: env!("CARGO_PKG_VERSION").to_string(),
         };
         Arc::new(Self {
-            pool,
+            pool: ArcSwap::new(Arc::new(pool)),
             cfg,
             data_dir,
             server_info: RwLock::new(info),

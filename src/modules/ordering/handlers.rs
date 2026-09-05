@@ -61,7 +61,7 @@ async fn suppliers(State(state): State<SharedState>) -> impl IntoResponse {
     match sqlx::query_as::<_, (String, String)>(
         "SELECT code, name FROM suppliers WHERE is_active = 1 ORDER BY code",
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&*state.pool_arc())
     .await
     {
         Ok(rows) => (
@@ -87,7 +87,7 @@ async fn sheet(
         );
     }
     let branch = effective_branch(&state, query.branch);
-    match db::order_sheet(&state.pool, &supplier, branch.map(|b| b as i64), query.active_only).await {
+    match db::order_sheet(&*state.pool_arc(), &supplier, branch.map(|b| b as i64), query.active_only).await {
         Ok(lines) => (
             StatusCode::OK,
             Json(json!({ "supplier": supplier, "branch": branch, "lines": lines })),
@@ -116,7 +116,7 @@ async fn post_order(
     // 1. persist order (G-10 lifecycle: status 'open'); resolve supplier id
     let sup_id: Option<i64> = sqlx::query_scalar("SELECT id FROM suppliers WHERE code = ?1")
         .bind(&body.supplier)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&*state.pool_arc())
         .await
         .unwrap_or(None);
     let lines: Vec<(String, f64, f64, f64)> = body
@@ -125,7 +125,7 @@ async fn post_order(
         .map(|l| (l.upc.clone(), l.qty, l.unit_cost, l.suggested_qty))
         .collect();
     let order_id = match orders::create_order(
-        &state.pool,
+        &*state.pool_arc(),
         &state.cfg.sync.install_name,
         branch,
         sup_id,
@@ -184,7 +184,7 @@ async fn post_order(
     let placed_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let install = state.cfg.sync.install_name.clone();
     let incoming_id = uuid::Uuid::new_v4().to_string();
-    let mut tx = match state.pool.begin().await {
+    let mut tx = match state.pool_arc().begin().await {
         Ok(tx) => tx,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("Failed to begin tx: {e}") }))),
     };
@@ -253,7 +253,7 @@ async fn list_orders(
     State(state): State<SharedState>,
     Query(query): Query<ListOrdersQuery>,
 ) -> impl IntoResponse {
-    match orders::list_orders(&state.pool, query.branch, query.status.as_deref()).await {
+    match orders::list_orders(&*state.pool_arc(), query.branch, query.status.as_deref()).await {
         Ok(list) => (StatusCode::OK, Json(json!({ "orders": list }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -273,7 +273,7 @@ async fn confirmation_csv(
     State(state): State<SharedState>,
     Query(query): Query<ConfirmQuery>,
 ) -> impl IntoResponse {
-    let order = match orders::list_orders(&state.pool, None, None).await {
+    let order = match orders::list_orders(&*state.pool_arc(), None, None).await {
         Ok(list) => list.into_iter().find(|o| o.id == query.order_id),
         Err(e) => {
             return (
@@ -295,7 +295,7 @@ async fn confirmation_csv(
             "SELECT COALESCE(description, ''), COALESCE(pack_units, 1) FROM items WHERE upc = ?1",
         )
         .bind(&l.upc)
-        .fetch_one(&state.pool)
+        .fetch_one(&*state.pool_arc())
         .await
         .map(|(d, p)| (d, p))
         .unwrap_or_default();
@@ -313,7 +313,7 @@ async fn confirmation_csv(
 
 /// Incoming PO list with status (W5): files tracked in incoming_pos.
 async fn incoming_po(State(state): State<SharedState>) -> impl IntoResponse {
-    match crate::modules::incoming_po::list(&state.pool).await {
+    match crate::modules::incoming_po::list(&*state.pool_arc()).await {
         Ok(files) => (StatusCode::OK, Json(json!({ "incoming": files }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -353,7 +353,7 @@ async fn delete_incoming_po(
             }
         }
     }
-    match crate::modules::incoming_po::remove(&state.pool, &query.filename).await {
+    match crate::modules::incoming_po::remove(&*state.pool_arc(), &query.filename).await {
         Ok(n) => (
             StatusCode::OK,
             Json(json!({ "ok": true, "removed": n, "filename": query.filename })),

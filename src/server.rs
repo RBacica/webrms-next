@@ -51,16 +51,17 @@ fn info(state: &SharedState) -> ServerInfo {
 }
 
 async fn health(State(state): State<SharedState>) -> impl IntoResponse {
-    let db_ok = db::ping(&state.pool).await;
+    let db_ok = db::ping(&*state.pool_arc()).await;
     let info = info(&state);
     let poll = state.poller.read().map(|p| p.as_ref().map(|h| h.status())).unwrap_or(None);
     let (connector, last_poll) = match &poll {
         Some(st) => (
-            if st.last_error.is_some() { "error" } else { "ok" }.to_string(),
+            if st.last_error.is_some() { "error".to_string() } else { "ok".to_string() },
             st.last_success.clone(),
         ),
         None => ("disabled".to_string(), None),
     };
+    let fb = crate::fallback::read_state(&state.data_dir);
     (
         StatusCode::OK,
         Json(json!({
@@ -69,8 +70,19 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
             "mode": info.mode.as_str(),
             "connector": connector,
             "last_poll": last_poll,
-            "snapshot": "n/a",      // P3: snapshot staleness
-            "replication": "n/a",    // P3: replication lag
+            "fallback": {
+                "enabled": state.cfg.sync.fallback_enabled,
+                "engaged": fb.engaged,
+                "restored_at": fb.restored_at,
+                "recovered_at": fb.recovered_at,
+                "via": fb.via,
+                "size_bytes": fb.size_bytes,
+                "last_attempt": fb.last_attempt,
+                "last_error": fb.last_error,
+                "attempts": fb.attempts,
+            },
+            "snapshot": if fb.engaged { "fallback-active" } else { "available" },
+            "replication": "n/a", // replication-lag plumbing: P4 (D3 badges)
             "version": env!("CARGO_PKG_VERSION"),
         })),
     )
@@ -78,6 +90,7 @@ async fn health(State(state): State<SharedState>) -> impl IntoResponse {
 
 async fn mode(State(state): State<SharedState>) -> impl IntoResponse {
     let info = info(&state);
+    let fb = crate::fallback::read_state(&state.data_dir);
     (StatusCode::OK, Json(json!({
         "mode": info.mode.as_str(),
         "branch_id": info.branch_id,
@@ -85,6 +98,7 @@ async fn mode(State(state): State<SharedState>) -> impl IntoResponse {
         "version": info.version,
         "author": state.config_author(),
         "remote_hos": state.is_remote_hos(),
+        "fallback_engaged": fb.engaged,
     })))
 }
 
@@ -121,7 +135,7 @@ async fn sync_now(State(state): State<SharedState>) -> impl IntoResponse {
 async fn sync_snapshot(State(state): State<SharedState>) -> impl IntoResponse {
     let key = state.cfg.sync.snapshot_key.clone();
     let data_dir = state.data_dir.clone();
-    let pool = state.pool.clone();
+    let pool = state.pool_arc();
     match crate::snapshot::build_snapshot(&pool, &data_dir, &key).await {
         Ok((path, sig)) => match tokio::fs::read(&path).await {
             Ok(bytes) => {
@@ -183,7 +197,7 @@ async fn branches(State(state): State<SharedState>) -> impl IntoResponse {
     match sqlx::query_as::<_, (i64, String, Option<i64>, i64)>(
         "SELECT id, name, ext_key, is_ho FROM branches WHERE is_active = 1 ORDER BY id",
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&*state.pool_arc())
     .await
     {
         Ok(rows) => {

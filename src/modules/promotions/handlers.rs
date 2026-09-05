@@ -34,7 +34,7 @@ struct PromoQuery {
 }
 
 async fn get_engine(State(state): State<SharedState>) -> impl IntoResponse {
-    let engine = db::pricing_engine(&state.pool).await;
+    let engine = db::pricing_engine(&*state.pool_arc()).await;
     (
         StatusCode::OK,
         Json(json!({ "engine": engine, "read_only": true })),
@@ -46,9 +46,9 @@ async fn list_promotions(
     Query(query): Query<PromoQuery>,
 ) -> impl IntoResponse {
     let branch = effective_branch(&state, query.branch);
-    match db::list_promotions(&state.pool, branch).await {
+    match db::list_promotions(&*state.pool_arc(), branch).await {
         Ok(list) => {
-            let engine = db::pricing_engine(&state.pool).await;
+            let engine = db::pricing_engine(&*state.pool_arc()).await;
             let (active, inactive): (Vec<_>, Vec<_>) =
                 list.iter().partition(|p| p.active);
             (
@@ -86,7 +86,7 @@ async fn promotion_items(
         );
     }
     let branch = effective_branch(&state, query.branch);
-    match db::promotion_items(&state.pool, &id, branch).await {
+    match db::promotion_items(&*state.pool_arc(), &id, branch).await {
         Ok(items) => (StatusCode::OK, Json(json!(items))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -108,11 +108,11 @@ async fn effectiveness(
             Json(json!({ "error": "Missing 'from' and 'to' query parameters (YYYY-MM-DD format)" })),
         );
     }
-    match db::promotion_effectiveness(&state.pool, &from, &to, branch).await {
+    match db::promotion_effectiveness(&*state.pool_arc(), &from, &to, branch).await {
         Ok(rows) => (
             StatusCode::OK,
             Json(json!({
-                "engine": db::pricing_engine(&state.pool).await,
+                "engine": db::pricing_engine(&*state.pool_arc()).await,
                 "specials": rows,
             })),
         ),

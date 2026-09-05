@@ -1,6 +1,7 @@
 // Connector poll loop — periodic ingest from the live system (A5/A7).
 // Runs as a tokio background task; "sync now" endpoint triggers an immediate tick.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,9 @@ pub struct Poller {
     conn: Mutex<Box<dyn PollConn>>,
     interval: Duration,
     source: String,
-    running: Arc<std::sync::atomic::AtomicBool>,
+    running: Arc<AtomicBool>,
+    /// Consecutive connector-dead ticks (drives the snapshot fallback).
+    consecutive_failures: AtomicU64,
     pub status: Arc<std::sync::RwLock<PollStatus>>,
 }
 
@@ -62,76 +65,89 @@ impl Poller {
                 conn: Mutex::new(conn),
                 interval,
                 source,
-                running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                running: Arc::new(AtomicBool::new(false)),
+                consecutive_failures: AtomicU64::new(0),
                 status,
             }),
         }
     }
 
     /// One full ingest tick (reference + incremental pulls). Best-effort per
-    /// section: a failed table logs and continues; the circuit-breaker
-    /// backoff lives in the loop.
+    /// section: a failed table logs, records `last_error`, and continues.
+    /// After the sections, connector-death is detected (reference pull failed)
+    /// and the snapshot fallback may engage; a fully-successful tick clears
+    /// any engaged fallback (recovery).
     pub async fn tick(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().await;
         let c: &dyn Connector = conn.as_conn();
-        let pool = &self.state.pool;
+        let pool = self.state.pool_arc();
         let src = &self.source;
 
-        let mut items = 0u64;
-        let mut sales = 0u64;
-        let mut ok = true;
+        let mut failures: Vec<String> = Vec::new();
+        let mut reference_ok = true;
 
-        match ingest::ingest_reference(pool, c, src).await {
+        macro_rules! section {
+            ($name:literal, $e:expr) => {
+                match $e {
+                    Ok(n) if n > 0 => tracing::info!("poll: {} +{n}", $name),
+                    Ok(_) => {}
+                    Err(e) => { tracing::warn!("poll: {} failed: {e}", $name); failures.push(format!("{}: {e}", $name)); }
+                }
+            };
+        }
+
+        match ingest::ingest_reference(&pool, c, src).await {
             Ok(()) => tracing::info!("poll: reference ✓"),
-            Err(e) => { tracing::warn!("poll: reference failed: {e}"); ok = false; }
+            Err(e) => {
+                tracing::warn!("poll: reference failed: {e}");
+                failures.push(format!("reference: {e}"));
+                reference_ok = false;
+            }
         }
-        match ingest::ingest_items(pool, c, src).await {
-            Ok(n) => { items = n; if n > 0 { tracing::info!("poll: items +{n}"); } }
-            Err(e) => { tracing::warn!("poll: items failed: {e}"); ok = false; }
-        }
-        match ingest::ingest_stock(pool, c, src).await {
-            Ok(n) if n > 0 => tracing::info!("poll: stock +{n}"),
-            Ok(_) => {}
-            Err(e) => { tracing::warn!("poll: stock failed: {e}"); ok = false; }
-        }
-        match ingest::ingest_sales(pool, c, src).await {
-            Ok(n) => { sales = n; if n > 0 { tracing::info!("poll: sales +{n}"); } }
-            Err(e) => { tracing::warn!("poll: sales failed: {e}"); ok = false; }
-        }
-        match ingest::ingest_receipts(pool, c, src).await {
-            Ok(n) if n > 0 => tracing::info!("poll: receipts +{n}"),
-            Ok(_) => {}
-            Err(e) => { tracing::warn!("poll: receipts failed: {e}"); ok = false; }
-        }
+        section!("items", ingest::ingest_items(&pool, c, src).await);
+        section!("stock", ingest::ingest_stock(&pool, c, src).await);
+        section!("sales", ingest::ingest_sales(&pool, c, src).await);
+        section!("receipts", ingest::ingest_receipts(&pool, c, src).await);
+
         // incoming-PO lifecycle: flip waiting_import→pending_receipt→receipted
         // from the freshly pulled receipts (G-7)
         let install = self.state.cfg.sync.install_name.clone();
-        if let Err(e) = crate::modules::incoming_po::auto_flip(pool, &install).await {
+        if let Err(e) = crate::modules::incoming_po::auto_flip(&pool, &install).await {
             tracing::warn!("poll: incoming-po auto-flip failed: {e}");
         }
-        match ingest::ingest_ap(pool, c, src).await {
-            Ok(n) if n > 0 => tracing::info!("poll: ap +{n}"),
-            Ok(_) => {}
-            Err(e) => { tracing::warn!("poll: ap failed: {e}"); ok = false; }
-        }
-        match ingest::ingest_promos(pool, c, src).await {
-            Ok(n) if n > 0 => tracing::info!("poll: promos +{n}"),
-            Ok(_) => {}
-            Err(e) => { tracing::warn!("poll: promos failed: {e}"); ok = false; }
-        }
-        match ingest::ingest_rbp(pool, c, src).await {
-            Ok(n) if n > 0 => tracing::info!("poll: rbp +{n}"),
-            Ok(_) => {}
-            Err(e) => { tracing::warn!("poll: rbp failed: {e}"); ok = false; }
-        }
+        section!("ap", ingest::ingest_ap(&pool, c, src).await);
+        section!("promos", ingest::ingest_promos(&pool, c, src).await);
+        section!("rbp", ingest::ingest_rbp(&pool, c, src).await);
 
         // Record status for /api/health + UI badges (D3)
         let mut st = self.status.write().unwrap_or_else(|e| e.into_inner());
         st.tick_count += 1;
-        st.last_items = items;
-        st.last_sales = sales;
-        st.last_success = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-        if ok { st.last_error = None; }
+        if failures.is_empty() {
+            st.last_error = None;
+            st.last_success = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        } else {
+            st.last_error = Some(failures.join("; "));
+        }
+        drop(st);
+        drop(conn);
+
+        if reference_ok && failures.is_empty() {
+            // Fully successful: the connector is alive — clear any fallback.
+            self.consecutive_failures.store(0, Ordering::SeqCst);
+            crate::fallback::clear_if_engaged(&self.state.data_dir);
+        } else if !reference_ok {
+            // Connector dead (or unusable): count consecutive failures and
+            // engage the snapshot fallback at the threshold.
+            let n = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+            if n >= crate::fallback::FAIL_THRESHOLD {
+                // Engage from a spawned task so the poll loop never blocks on
+                // the snapshot download/swap.
+                let state = self.state.clone();
+                tokio::spawn(async move {
+                    crate::fallback::maybe_engage(state).await;
+                });
+            }
+        }
         Ok(())
     }
 

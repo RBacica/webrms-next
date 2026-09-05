@@ -32,7 +32,7 @@ pub fn routes() -> axum::Router<SharedState> {
 }
 
 async fn get_departments(State(state): State<SharedState>) -> impl IntoResponse {
-    match db::get_departments(&state.pool).await {
+    match db::get_departments(&*state.pool_arc()).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -42,7 +42,7 @@ async fn get_departments(State(state): State<SharedState>) -> impl IntoResponse 
 }
 
 async fn get_suppliers(State(state): State<SharedState>) -> impl IntoResponse {
-    match db::get_suppliers(&state.pool).await {
+    match db::get_suppliers(&*state.pool_arc()).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -56,7 +56,7 @@ async fn get_suppliers_for_dept(
     Query(query): Query<db::DeptQuery>,
 ) -> impl IntoResponse {
     let dept = query.department.clone().unwrap_or_else(|| "ALL".to_string());
-    match db::get_suppliers_for_department(&state.pool, &dept).await {
+    match db::get_suppliers_for_department(&*state.pool_arc(), &dept).await {
         Ok(list) => (StatusCode::OK, Json(json!(list))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -70,7 +70,7 @@ async fn get_sub_departments(
     Query(query): Query<db::SubDeptQuery>,
 ) -> impl IntoResponse {
     let dept = query.department.clone().unwrap_or_default();
-    match db::get_sub_departments(&state.pool, &dept).await {
+    match db::get_sub_departments(&*state.pool_arc(), &dept).await {
         Ok(subs) => (StatusCode::OK, Json(json!(subs))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -88,7 +88,7 @@ async fn search_items(
     let sub_dept = query.sub_department.clone().unwrap_or_else(|| "ALL".to_string());
     let branch = effective_branch(&state, query.branch);
 
-    match db::search_items(&state.pool, &dept, &sup, &sub_dept, branch).await {
+    match db::search_items(&*state.pool_arc(), &dept, &sup, &sub_dept, branch).await {
         Ok(items) => (
             StatusCode::OK,
             Json(json!({ "items": items, "branch": branch })),
@@ -112,7 +112,7 @@ async fn refresh_upc(
         );
     }
     let branch = effective_branch(&state, query.branch);
-    match db::refresh_upc(&state.pool, &upc, branch).await {
+    match db::refresh_upc(&*state.pool_arc(), &upc, branch).await {
         Ok(stock_on_hand) => (
             StatusCode::OK,
             Json(json!({ "upc": upc, "stock_on_hand": stock_on_hand })),
@@ -136,7 +136,7 @@ async fn barcode_lookup(
         );
     }
     let branch = effective_branch(&state, query.branch);
-    match db::barcode_lookup_upcs(&state.pool, &barcode).await {
+    match db::barcode_lookup_upcs(&*state.pool_arc(), &barcode).await {
         Ok(upcs) => (
             StatusCode::OK,
             Json(json!({ "upcs": upcs, "branch": branch })),

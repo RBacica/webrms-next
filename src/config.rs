@@ -35,7 +35,7 @@ pub struct DatabaseConfig {
     pub connection_string: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -49,9 +49,35 @@ pub struct SyncConfig {
     /// HMAC key for snapshot signing (O-5). Empty = unsigned dev mode.
     #[serde(default)]
     pub snapshot_key: String,
+    /// Automatic snapshot fallback (5b): when the connector stays dead, a
+    /// client restores the HoS snapshot so reads keep serving. Default on.
+    #[serde(default = "default_fallback_enabled")]
+    pub fallback_enabled: bool,
+    /// Min minutes between fallback attempts while the connector stays dead.
+    #[serde(default = "default_fallback_cooldown")]
+    pub fallback_cooldown_minutes: u64,
 }
 
 fn default_install() -> String { "local".into() }
+fn default_fallback_enabled() -> bool { true }
+fn default_fallback_cooldown() -> u64 { 15 }
+
+impl Default for SyncConfig {
+    /// Programmatic default matches the serde defaults used when parsing
+    /// config.toml (fallback ON, 15-min cooldown) — derive(Default) would
+    /// silently give `false`/0 and defeat the snapshot fallback.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source: String::new(),
+            poll_interval_minutes: default_poll(),
+            install_name: default_install(),
+            snapshot_key: String::new(),
+            fallback_enabled: default_fallback_enabled(),
+            fallback_cooldown_minutes: default_fallback_cooldown(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleConfig {

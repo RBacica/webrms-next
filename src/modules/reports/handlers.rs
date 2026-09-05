@@ -49,7 +49,7 @@ async fn get_daily(
         return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
     };
     let branch = effective_branch(&state, query.branch).map(|b| b as i64);
-    match db::daily_summary(&state.pool, &from, &to, branch).await {
+    match db::daily_summary(&*state.pool_arc(), &from, &to, branch).await {
         Ok(report) => (StatusCode::OK, Json(json!(report))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -66,7 +66,7 @@ async fn get_depts(
         return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
     };
     let branch = effective_branch(&state, query.branch).map(|b| b as i64);
-    match db::dept_sales(&state.pool, &from, &to, branch, query.dept.map(|d| d as i64)).await {
+    match db::dept_sales(&*state.pool_arc(), &from, &to, branch, query.dept.map(|d| d as i64)).await {
         Ok(depts) => (StatusCode::OK, Json(json!(depts))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -80,7 +80,7 @@ async fn get_overview(
     Query(query): Query<ReportQuery>,
 ) -> impl IntoResponse {
     let branch = effective_branch(&state, query.branch).map(|b| b as i64);
-    match db::overview(&state.pool, branch).await {
+    match db::overview(&*state.pool_arc(), branch).await {
         Ok(overview) => (StatusCode::OK, Json(json!(overview))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -97,7 +97,7 @@ async fn get_movers(
         return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
     };
     let branch = effective_branch(&state, query.branch).map(|b| b as i64);
-    match db::top_movers(&state.pool, &from, &to, branch, query.dept.map(|d| d as i64), query.limit.unwrap_or(20)).await {
+    match db::top_movers(&*state.pool_arc(), &from, &to, branch, query.dept.map(|d| d as i64), query.limit.unwrap_or(20)).await {
         Ok(movers) => (StatusCode::OK, Json(json!(movers))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -114,7 +114,7 @@ async fn get_dept_movers(
         return bad("Missing 'from' and 'to' query parameters (YYYY-MM-DD format)");
     };
     let branch = effective_branch(&state, query.branch).map(|b| b as i64);
-    match db::dept_movers(&state.pool, &from, &to, branch).await {
+    match db::dept_movers(&*state.pool_arc(), &from, &to, branch).await {
         Ok(movers) => (StatusCode::OK, Json(json!(movers))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -128,7 +128,7 @@ async fn get_dept_weekly(
     Query(query): Query<ReportQuery>,
 ) -> impl IntoResponse {
     let branch = effective_branch(&state, query.branch).map(|b| b as i64);
-    match db::dept_weekly(&state.pool, branch).await {
+    match db::dept_weekly(&*state.pool_arc(), branch).await {
         Ok(rows) => (StatusCode::OK, Json(json!(rows))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

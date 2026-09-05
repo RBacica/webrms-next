@@ -6,6 +6,7 @@
 use super::*;
 use futures_util::StreamExt;
 use tiberius::{Client, Config};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
@@ -22,8 +23,14 @@ impl HosConnector {
 
     async fn connect(&self) -> anyhow::Result<Client<TcpStreamCompat>> {
         let (cfg, host_port) = parse_conn_string(&self.conn_string)?;
-        let tcp = TcpStream::connect(&host_port).await?;
-        Ok(Client::connect(cfg, tcp.compat_write()).await?)
+        // A5: never hang a poll on a dead box — bound the TCP + login phases.
+        let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&host_port))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect to {host_port} timed out (10s)"))??;
+        let client = tokio::time::timeout(Duration::from_secs(10), Client::connect(cfg, tcp.compat_write()))
+            .await
+            .map_err(|_| anyhow::anyhow!("SQL login to {host_port} timed out (10s)"))??;
+        Ok(client)
     }
 }
 

@@ -246,7 +246,7 @@ pub async fn outbox_route(
          ORDER BY ts, id LIMIT 500",
     )
     .bind(since_ts).bind(since_id).bind(install)
-    .fetch_all(&state.pool).await
+    .fetch_all(&*state.pool_arc()).await
     .unwrap_or_default();
 
     let mut out = Vec::new();
@@ -291,14 +291,14 @@ pub async fn sync_up_route(
             Ok(p) => p,
             Err(e) => { errors.push(format!("{table}: bad payload: {e}")); continue; }
         };
-        match apply_row(&state.pool, table, row_id, op, &payload).await {
+        match apply_row(&*state.pool_arc(), table, row_id, op, &payload).await {
             Ok(_) => {
                 applied += 1;
                 applied_ids.push(r["id"].as_str().unwrap_or("").to_string());
                 // mark consumed so the sender can drop it
                 let _ = sqlx::query("UPDATE outbox SET applied = 1 WHERE id = ?1 AND origin_install = ?2")
                     .bind(r["id"].as_str().unwrap_or("")).bind(install)
-                    .execute(&state.pool).await;
+                    .execute(&*state.pool_arc()).await;
                 // CONFIG-DOWN relay: re-emit into OUR outbox so every other
                 // client pulls it down too (a Remote-HoS write must fan out to
                 // all branches via the HoS). Branch-scoped rows (orders/POs)
@@ -309,7 +309,7 @@ pub async fn sync_up_route(
                     let relay_table = table.to_string();
                     let relay_row_id = row_id.to_string();
                     let relay_install = state.cfg.sync.install_name.clone();
-                    let mut tx = match state.pool.begin().await {
+                    let mut tx = match state.pool_arc().begin().await {
                         Ok(tx) => tx,
                         Err(e) => { errors.push(format!("relay tx: {e}")); continue; }
                     };
@@ -446,7 +446,7 @@ pub async fn run_loop(state: SharedState) {
             continue;
         }
         let branch = state.server_info.read().ok().and_then(|i| i.branch_id).map(|b| b as i64);
-        match sync_once(&state.pool, &sync, branch).await {
+        match sync_once(&*state.pool_arc(), &sync, branch).await {
             Ok((pulled, pushed)) => {
                 consecutive_failures = 0;
                 if pulled > 0 || pushed > 0 {
@@ -473,7 +473,7 @@ pub fn notify_write(state: &SharedState) {
     if !sync.enabled || sync.source.is_empty() {
         return;
     }
-    let pool = state.pool.clone();
+    let pool = state.pool_arc();
     tokio::spawn(async move {
         let _ = push_once(&pool, &sync).await;
     });

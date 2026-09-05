@@ -62,13 +62,10 @@ pub async fn build_snapshot(pool: &sqlx::SqlitePool, data_dir: &Path, key: &str)
     Ok((final_path, sig))
 }
 
-/// Client: fetch snapshot from `source`, verify HMAC (when key non-empty),
-/// decompress, and atomically replace the local DB at `db_path`.
-pub async fn restore_snapshot(
-    source: &str,
-    key: &str,
-    db_path: &Path,
-) -> anyhow::Result<u64> {
+/// Client: fetch + verify the snapshot from `source` and return the raw
+/// gzip bytes (nothing touches the local DB yet — the caller installs later,
+/// so the app keeps serving while the download runs).
+pub async fn download_snapshot(source: &str, key: &str) -> anyhow::Result<Vec<u8>> {
     let src = source.trim_end_matches('/').to_string();
     let url = format!("{src}/api/sync/snapshot");
     let resp = reqwest::Client::new()
@@ -95,9 +92,15 @@ pub async fn restore_snapshot(
             anyhow::bail!("snapshot HMAC mismatch — refusing to restore");
         }
     }
+    Ok(gz.to_vec())
+}
 
+/// Client: decompress snapshot bytes and atomically replace the DB at
+/// `db_path` (write tmp next to target, rename over). The caller is
+/// responsible for quiescing the pool first.
+pub async fn install_snapshot(gz: &[u8], db_path: &Path) -> anyhow::Result<()> {
     // decompress
-    let mut dec = flate2::read::GzDecoder::new(&gz[..]);
+    let mut dec = flate2::read::GzDecoder::new(gz);
     let mut raw = Vec::new();
     std::io::Read::read_to_end(&mut dec, &mut raw)?;
 
@@ -105,5 +108,18 @@ pub async fn restore_snapshot(
     let tmp = db_path.with_extension(format!("db.tmp-{}", SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()));
     std::fs::write(&tmp, &raw)?;
     std::fs::rename(&tmp, db_path)?;
-    Ok(gz.len() as u64)
+    Ok(())
+}
+
+/// Client: fetch snapshot from `source`, verify HMAC (when key non-empty),
+/// decompress, and atomically replace the local DB at `db_path`.
+pub async fn restore_snapshot(
+    source: &str,
+    key: &str,
+    db_path: &Path,
+) -> anyhow::Result<u64> {
+    let gz = download_snapshot(source, key).await?;
+    let len = gz.len() as u64;
+    install_snapshot(&gz, db_path).await?;
+    Ok(len)
 }

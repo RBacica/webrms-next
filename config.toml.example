@@ -26,3 +26,11 @@ source = ""            # HoS WebRMS-Next address, e.g. http://100.71.113.111:808
 poll_interval_minutes = 15
 # Unique identity for this install (outbox origin_install + sync routing).
 install_name = "local"
+# Snapshot fallback (5b): HMAC key used to sign/verify catalog snapshots.
+# Empty = unsigned (dev). MUST match on the HoS and its clients.
+snapshot_key = ""
+# Automatic fallback: when the live connector stays dead (3 failed polls) a
+# client restores the HoS snapshot so reads keep serving. Default on.
+fallback_enabled = true
+# Min minutes between fallback attempts while the connector stays dead.
+fallback_cooldown_minutes = 15

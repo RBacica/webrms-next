@@ -785,6 +785,8 @@ fn hos_sync(url: &str) -> webrms_next::config::SyncConfig {
         poll_interval_minutes: 1,
         install_name: "bos-2".into(),
         snapshot_key: String::new(),
+        fallback_enabled: true,
+        fallback_cooldown_minutes: 0,
     }
 }
 
@@ -826,4 +828,106 @@ async fn snapshot_signed_restore_round_trip() {
     assert_eq!(items, 1);
     let suppliers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suppliers").fetch_one(&pool).await.unwrap();
     assert_eq!(suppliers, 1);
+}
+
+// ── P3-finish: automatic snapshot fallback (5b) — dead connector → engage ─────
+
+#[tokio::test]
+async fn fallback_engages_on_dead_connector_and_preserves_local_rows() {
+    use std::time::Duration;
+    use webrms_next::connector::hos::HosConnector;
+    use webrms_next::poller::Poller;
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_test_writer()
+        .try_init();
+
+    // HoS serving a signed snapshot
+    let hos_tmp = tempfile::tempdir().unwrap();
+    let hos_pool = webrms_next::db::init_pool(hos_tmp.path()).await.unwrap();
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'Branch 17', 0)")
+        .execute(&hos_pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(&hos_pool).await.unwrap();
+    sqlx::query("INSERT INTO items (id, upc, sku, description, cost, price1, is_active) \
+                 VALUES (1, '5010677014205', 'S1', 'Jameson 1L', 40.0, 59.99, 1)")
+        .execute(&hos_pool).await.unwrap();
+    let mut hos_cfg = AppConfig::default();
+    hos_cfg.role.mode = "hos".into();
+    hos_cfg.sync.snapshot_key = "test-key-123".into();
+    let hos_state = AppState::new(hos_pool, hos_cfg, hos_tmp.path().to_path_buf());
+    let (hos_url, _app) = serve_app(hos_state).await;
+
+    // BoS client: its own local rows + a connector pointed at a dead host
+    let client_dir = tempfile::tempdir().unwrap();
+    let client_pool = webrms_next::db::init_pool(client_dir.path()).await.unwrap();
+    sqlx::query("INSERT INTO branches (id, name, is_ho) VALUES (1, 'HoS', 1), (2, 'Branch 17', 0)")
+        .execute(&client_pool).await.unwrap();
+    sqlx::query("INSERT INTO suppliers (id, ext_key, code, name) VALUES (1, '010', '010', 'Tasman Liquor')")
+        .execute(&client_pool).await.unwrap();
+    // local app-authored rows + watermarks that MUST survive the restore
+    sqlx::query("INSERT INTO orders (id, origin_install, branch_id, supplier_id, placed_at, status, total_qty, total_cost) \
+                 VALUES ('ord-1', 'bos-2', 2, 1, '2026-09-05 10:00:00', 'open', 6, 240.0)")
+        .execute(&client_pool).await.unwrap();
+    sqlx::query("INSERT INTO order_lines (id, order_id, upc, qty, unit_cost, line_total) \
+                 VALUES ('ol-1', 'ord-1', '5010677014205', 6, 40.0, 240.0)")
+        .execute(&client_pool).await.unwrap();
+    sqlx::query("INSERT INTO outbox (id, origin_install, table_name, row_id, op, payload, applied) \
+                 VALUES ('ob-1', 'bos-2', 'orders', 'ord-1', 'insert', '{}', 0)")
+        .execute(&client_pool).await.unwrap();
+    sqlx::query("INSERT INTO high_watermarks (source, table_name, last_key) VALUES ('new-hos', 'items', 'KEEP-ME')")
+        .execute(&client_pool).await.unwrap();
+
+    let mut cfg = AppConfig::default();
+    cfg.role.mode = "bos".into();
+    cfg.sync.enabled = true;
+    cfg.sync.source = hos_url.clone();
+    cfg.sync.install_name = "bos-2".into();
+    cfg.sync.snapshot_key = "test-key-123".into();
+    cfg.sync.fallback_cooldown_minutes = 0;
+    let state = AppState::new(client_pool, cfg, client_dir.path().to_path_buf());
+
+    let conn = HosConnector::new(
+        "server=tcp:127.0.0.1,1;database=AKPOS;uid=x;pwd=y;encrypt=false;".into(),
+    );
+    let handle = Poller::new(state.clone(), Box::new(conn), Duration::from_secs(3600), "new-hos".into());
+
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(before, 0, "client has no catalog yet (connector dead since boot)");
+
+    // 3 ticks of a dead reference pull reach the FAIL_THRESHOLD on the last
+    for _ in 0..3 {
+        handle.tick_now().await.unwrap();
+    }
+    // engage runs in a spawned task — wait for the sidecar to flip
+    let mut engaged = false;
+    for _ in 0..100 {
+        if webrms_next::fallback::read_state(client_dir.path()).engaged {
+            engaged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(engaged, "fallback must engage after 3 dead ticks");
+
+    // reads now serve the HoS snapshot catalog...
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items").fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(items, 1, "catalog came from the snapshot");
+    let desc: String = sqlx::query_scalar("SELECT description FROM items WHERE upc='5010677014205'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(desc, "Jameson 1L");
+    // ...and local app rows + watermarks survived the swap
+    let orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders WHERE id='ord-1'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(orders, 1, "pending order preserved across restore");
+    let ob: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE id='ob-1'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(ob, 1, "pending outbox row preserved");
+    let hw: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM high_watermarks WHERE last_key='KEEP-ME'")
+        .fetch_one(&*state.pool_arc()).await.unwrap();
+    assert_eq!(hw, 1, "connector watermark preserved (no re-pull from HoS positions)");
+
+    let meta = webrms_next::fallback::read_state(client_dir.path());
+    assert_eq!(meta.via, hos_url, "sidecar records the snapshot source");
+    assert!(meta.size_bytes > 0, "sidecar records snapshot size");
 }
