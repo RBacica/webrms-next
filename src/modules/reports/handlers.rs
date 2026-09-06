@@ -21,6 +21,7 @@ use crate::util::effective_branch;
 pub fn routes() -> axum::Router<SharedState> {
     axum::Router::new()
         .route("/api/reports/daily", axum::routing::get(get_daily))
+        .route("/api/reports/departments", axum::routing::get(get_departments))
         .route("/api/reports/depts", axum::routing::get(get_depts))
         .route("/api/reports/overview", axum::routing::get(get_overview))
         .route("/api/reports/overview/movers", axum::routing::get(get_movers))
@@ -230,5 +231,12 @@ async fn get_promo_summary(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Database error: {e}") })),
         ),
+    }
+}
+
+async fn get_departments(State(state): State<SharedState>) -> impl IntoResponse {
+    match db::departments(&*state.pool_arc()).await {
+        Ok(list) => (StatusCode::OK, Json(json!(list))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("{e}") }))),
     }
 }

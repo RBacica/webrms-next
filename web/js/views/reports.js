@@ -24,6 +24,7 @@ export async function render(el, { API, SERVER }) {
       <label>From</label><input type="date" id="rp-from" value="${from}">
       <label>To</label><input type="date" id="rp-to" value="${to}">
       ${SERVER.author || SERVER.mode === "hos" ? `<select id="rp-branch">${branchOpts(SERVER)}</select>` : ""}
+      <select id="rp-dept-filter" style="display:none"><option value="">All departments</option></select>
       <div class="btn-group" id="rp-tabs">
         ${REPORTS.map((r, i) => `<button data-rp="${r.id}" class="${i === 0 ? "active" : "secondary"}">${r.label}</button>`).join("")}
       </div>
@@ -38,9 +39,32 @@ export async function render(el, { API, SERVER }) {
   let lastData = null;
 
   const branchQ = () => {
-    const b = $("#rp-branch")?.value;
+    const b = $("rp-branch")?.value;
     return b && b !== "ALL" ? `&branch=${b}` : "";
   };
+  const deptQ = () => {
+    const d = $("rp-dept-filter")?.value;
+    return d ? `&dept=${d}` : "";
+  };
+
+  // load dept filter options (shown only on the Dept & Product tab)
+  API.get("/api/reports/departments")
+    .then((list) => {
+      const sel = $("rp-dept-filter");
+      if (!sel) return;
+      (list || []).forEach((d) => {
+        const o = document.createElement("option");
+        o.value = d.id;
+        o.textContent = d.name;
+        sel.appendChild(o);
+      });
+    })
+    .catch(() => { /* filter is optional */ });
+
+  function showDeptFilter(show) {
+    const sel = $("rp-dept-filter");
+    if (sel) sel.style.display = show ? "" : "none";
+  }
 
   async function run() {
     const f = $("#rp-from").value, t = $("#rp-to").value;
@@ -58,7 +82,8 @@ export async function render(el, { API, SERVER }) {
           break;
         }
         case "depts": {
-          const d = await API.get(`/api/reports/depts?from=${f}&to=${t}${branchQ()}`);
+          showDeptFilter(true);
+          const d = await API.get(`/api/reports/depts?from=${f}&to=${t}${branchQ()}${deptQ()}`);
           lastData = null;
           res.innerHTML = d.map((dept) => `
             <div class="panel" style="margin-bottom:10px">
@@ -176,16 +201,18 @@ export async function render(el, { API, SERVER }) {
     b.onclick = () => {
       el.querySelectorAll("[data-rp]").forEach((x) => x.classList.toggle("active", x === b));
       current = b.dataset.rp;
+      showDeptFilter(current === "depts");
       run();
     };
   }
-  $("#rp-csv").onclick = () => {
+  $("rp-csv").onclick = () => {
     if (!lastData) return;
     const lines = [lastData.head.join(","), ...lastData.rows.map((r) => r.map((c) => String(c).replace(/,/g, " ")).join(","))];
     download("report.csv", lines.join("\n"));
   };
   for (const id of ["rp-from", "rp-to"]) $(id).onchange = run;
-  $("#rp-branch") && ($("#rp-branch").onchange = run);
+  $("rp-branch") && ($("rp-branch").onchange = run);
+  $("rp-dept-filter") && ($("rp-dept-filter").onchange = run);
 
   run();
 }

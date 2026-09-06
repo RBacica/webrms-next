@@ -1061,3 +1061,19 @@ pub async fn promo_summary(pool: &SqlitePool, from: &str, to: &str) -> anyhow::R
     top.truncate(3);
     Ok(PromoSummary { measured, top })
 }
+
+// ── Departments list (reports dept filter) ───────────────────────────────────
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct DeptInfo {
+    pub id: i64,
+    pub name: String,
+}
+
+pub async fn departments(pool: &SqlitePool) -> anyhow::Result<Vec<DeptInfo>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT d.id, COALESCE(d.name, '') FROM departments d \
+         WHERE COALESCE(d.name, '') NOT IN ('Non Sales', 'EPay') ORDER BY d.name",
+    ).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|(id, name)| DeptInfo { id, name }).collect())
+}
