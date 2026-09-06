@@ -21,6 +21,7 @@ export async function render(el, { API, SERVER }) {
         <button id="od-csv" class="secondary" title="Download supplier confirmation CSV">CSV</button>
         <button id="od-export" class="secondary" title="Save sheet CSV to the server + download">Export CSV</button>
         <button id="od-print" class="secondary" title="Print the order sheet">🖨 Print</button>
+        <button id="od-print-confirm" class="secondary" title="Print the posted PO confirmation" style="display:none">🖨 Confirmation</button>
       </div>
     </div>
     <div id="od-settings-panel" class="panel" style="display:none; margin:10px 0"></div>
@@ -214,6 +215,8 @@ export async function render(el, { API, SERVER }) {
       $("od-msg").className = "msg success";
       $("od-msg").textContent = `PO ${r.po_file} → ${r.status} (Bol ${r.bill_of_lading})`;
       window._lastOrderId = r.order_id;
+      window._lastOrder = { supplier: $("od-supplier").value, branch: $("od-branch").value, lines, po_file: r.po_file, status: r.status, bol: r.bill_of_lading };
+      $("od-print-confirm").style.display = "";
     } catch (e) { $("od-msg").className = "msg error"; $("od-msg").textContent = e.message; }
   };
 
@@ -228,6 +231,7 @@ export async function render(el, { API, SERVER }) {
   };
 
   $("od-print").onclick = () => printSheet(sheet);
+  $("od-print-confirm").onclick = () => printConfirmation(window._lastOrder);
 
   $("od-export").onclick = async () => {
     const lines = qtyLines();
@@ -245,6 +249,32 @@ export async function render(el, { API, SERVER }) {
   };
 }
 
+function printConfirmation(o) {
+  if (!o || !o.lines || !o.lines.length) return;
+  const asOf = new Date().toLocaleString();
+  const total = o.lines.reduce((a, l) => a + l.qty * l.unit_cost, 0);
+  const w = window.open("", "_blank", "width=900,height=700");
+  if (!w) return;
+  w.document.write(`<html><head><title>PO Confirmation</title><style>
+    body{font-family:system-ui,sans-serif;margin:24px;color:#222}
+    h1{font-size:18px;margin:0 0 4px}.sub{color:#666;font-size:12px;margin-bottom:14px}
+    .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;font-size:12px;margin-bottom:14px}
+    .kv b{color:#666;font-weight:600}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}
+    th{background:#f0f0f0}.l{text-align:left}.total td{border-top:2px solid #333;font-weight:bold}
+    @media print{body{margin:8mm}}
+  </style></head><body>
+    <h1>Supplier Order Confirmation</h1>
+    <div class="sub">${asOf} · ${o.status || ""} · Bol ${o.bol || ""} · ${o.po_file || ""}</div>
+    <div class="kv"><b>Supplier</b><span>${esc(o.supplier)}</span><b>Branch</b><span>${esc(o.branch || "All")}</span></div>
+    <table><thead><tr><th class="l">UPC</th><th class="l">Description</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">Total</th></tr></thead>
+    <tbody>${o.lines.map((l) => `<tr><td class="l">${esc(l.upc)}</td><td class="l">${esc(l.description || "")}</td><td>${l.qty}</td><td>${l.unit_cost.toFixed(2)}</td><td>${(l.qty * l.unit_cost).toFixed(2)}</td></tr>`).join("")}
+    <tr class="total"><td colspan="4" class="l">Total</td><td>${total.toFixed(2)}</td></tr></tbody></table>
+    <script>window.onload=function(){setTimeout(function(){window.print();},300)}<\/script>
+  </body></html>`);
+  w.document.close();
+}
 function printSheet(sheet) {
   if (!sheet || !sheet.length) return;
   const qtyOf = (upc) => document.querySelector(`.od-qty[data-upc="${upc}"]`)?.value ?? "";

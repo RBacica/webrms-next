@@ -24,30 +24,46 @@ export async function render(el, { API, SERVER }) {
     $("pr-results").innerHTML = `<div class="table-wrap"><table><colgroup><col><col><col class="c-num"><col><col></colgroup>
       <thead><tr><th>Description</th><th>Scope</th><th class="num">Price</th><th>Window</th><th></th></tr></thead>
       <tbody>${d.promotions.map((p) => `<tr>
-        <td>${esc(p.description || p.product)}<div class="muted">${p.id}</div></td>
+        <td><button class="pm-expand secondary" data-id="${p.id}" data-name="${esc(p.description || p.product)}" style="padding:1px 8px;font-size:11px">▸</button> ${esc(p.description || p.product)}<div class="muted">${p.id}</div></td>
         <td>${p.scope}</td><td class="num">${fmt$(p.price)}</td>
         <td>${esc(p.from_date || "")} → ${esc(p.to_date || "")}</td>
-        <td><button class="secondary" data-id="${p.id}" data-name="${esc(p.description || p.product)}" onclick="window.__prItems(this)">Items</button></td>
+        <td></td>
       </tr>`).join("")}</tbody></table></div>`;
+    for (const btn of el.querySelectorAll(".pm-expand")) {
+      btn.onclick = () => togglePromoItems(btn);
+    }
   }
 
-  window.__prItems = async (btn) => {
+  async function togglePromoItems(btn) {
+    const row = btn.closest("tr");
+    const id = btn.dataset.id;
+    const name = btn.dataset.name;
+    const existing = row.nextElementSibling;
+    const open = existing && existing.classList.contains("pm-items-row") && existing.dataset.id === id;
+    if (open) {
+      existing.remove();
+      btn.textContent = "▸";
+      return;
+    }
+    if (existing && existing.classList.contains("pm-items-row")) existing.remove();
+    row.insertAdjacentHTML("afterend", `<tr class="pm-items-row" data-id="${esc(id)}">
+      <td colspan="5" style="padding:0;background:rgba(139,147,161,0.05)">
+        <div class="pm-items" data-id="${esc(id)}" style="padding:8px 14px 8px 38px;font-size:12px"><span class="muted">Loading items…</span></div>
+      </td></tr>`);
+    btn.textContent = "▾";
+    const box = row.nextElementSibling.querySelector(".pm-items");
     try {
-      const it = await API.get(`/api/promotions/items?id=${btn.dataset.id}${SERVER.branch ? `&branch=${SERVER.branch}` : ""}`);
-      let html = `<h3>${btn.dataset.name} — ${it.items.length} items</h3>`;
-      if (it.deal) {
-        html += `<p class="muted">${it.deal.deal_type}${it.deal.deal_price ? ` @ ${fmt$(it.deal.deal_price)}` : ""}${it.deal.discount_pct ? ` ${it.deal.discount_pct}% off` : ""}</p>`;
-      }
+      const it = await API.get(`/api/promotions/items?id=${id}${SERVER.branch ? `&branch=${SERVER.branch}` : ""}`);
+      let html = `<b>${name}</b> — ${it.items.length} items`;
+      if (it.deal) html += `<p class="muted">${it.deal.deal_type}${it.deal.deal_price ? ` @ ${fmt$(it.deal.deal_price)}` : ""}${it.deal.discount_pct ? ` ${it.deal.discount_pct}% off` : ""}</p>`;
       html += `<div class="table-wrap"><table><colgroup><col><col class="c-num"><col class="c-num"><col class="c-num"></colgroup>
         <thead><tr><th>Item</th><th class="num">Avg cost</th><th class="num">Disc%</th><th class="num">GP%</th></tr></thead>
         <tbody>${it.items.map((i) => `<tr><td>${esc(i.description)}<div class="muted">${i.upc} · ${i.cost_source}</div></td>
           <td class="num">${fmt$(i.avg_cost)}</td><td class="num">${i.discount_pct === null ? "—" : i.discount_pct.toFixed(1) + "%"}</td>
           <td class="num">${i.gp_pct === null ? "—" : i.gp_pct.toFixed(1) + "%"}</td></tr>`).join("")}</tbody></table></div>`;
-      $("pr-results").innerHTML = `<div class="panel" style="margin:0">${html}</div>`;
-      $("pr-msg").className = "msg";
-      $("pr-msg").textContent = "Back to list: click Promotions.";
-    } catch (e) { $("pr-msg").className = "msg error"; $("pr-msg").textContent = e.message; }
-  };
+      box.innerHTML = html;
+    } catch (e) { box.innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  }
 
   $("pr-eff").onclick = async () => {
     $("pr-eff").classList.add("active"); $("pr-list").classList.remove("active");

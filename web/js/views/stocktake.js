@@ -188,16 +188,44 @@ export async function render(el, { API, SERVER }) {
   $("st-supplier").onchange = () => { supplierFilter = $("st-supplier").value; renderRows(); };
   $("st-uncounted").onchange = () => { uncountedOnly = $("st-uncounted").checked; renderRows(); };
 
+  function askDestination(rows) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100";
+      overlay.innerHTML = `
+        <div class="panel" style="min-width:380px">
+          <h3>Export ${rows.length} rows</h3>
+          <p class="muted" style="margin-bottom:12px">Where should the files go?</p>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <button id="ask-server">Save to server (data/output)</button>
+            <button id="ask-client" class="secondary">Download to this device</button>
+            <button id="ask-cancel" class="secondary">Cancel</button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+      overlay.querySelector("#ask-server").onclick = () => { overlay.remove(); resolve("server"); };
+      overlay.querySelector("#ask-client").onclick = () => { overlay.remove(); resolve("client"); };
+      overlay.querySelector("#ask-cancel").onclick = () => { overlay.remove(); resolve(null); };
+    });
+  }
+
   $("st-save").onclick = async () => {
     const rows = saveRows();
     if (!rows.length) { msg("Nothing counted yet — enter counts first", "warn"); return; }
+    const destination = await askDestination(rows);
+    if (!destination) return;
     try {
       const r = await API.send("POST", "/api/stocktake/export", {
-        destination: "server",
+        destination,
         branch: SERVER.branch || undefined,
         rows,
       });
-      msg(`Saved ${r.count_rows} count lines → ${r.count_file || r.ticket_file || "files"} (run recorded)`, "success");
+      if (destination === "client" && r.files) {
+        for (const f of r.files) download(f.filename, f.content, "text/plain");
+        msg(`Downloaded ${r.count_rows} count + ${r.ticket_rows} ticket lines (run recorded)`, "success");
+      } else {
+        msg(`Saved ${r.count_rows} count lines → ${r.count_file || r.ticket_file || "files"} (run recorded)`, "success");
+      }
       session.clear();
       renderRows();
       qEl().focus();
