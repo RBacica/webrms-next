@@ -20,6 +20,7 @@ export async function render(el, { API, SERVER }) {
         <button id="od-post">Post order → ETL</button>
         <button id="od-csv" class="secondary" title="Download supplier confirmation CSV">CSV</button>
         <button id="od-export" class="secondary" title="Save sheet CSV to the server + download">Export CSV</button>
+        <button id="od-print" class="secondary" title="Print the order sheet">🖨 Print</button>
       </div>
     </div>
     <div id="od-settings-panel" class="panel" style="display:none; margin:10px 0"></div>
@@ -138,7 +139,8 @@ export async function render(el, { API, SERVER }) {
         <td class="num">${l.result.sellout_days}</td>
         <td class="num">${l.result.suggested}</td>
         <td class="num">${fmt$(l.unit_cost)}</td>
-        <td class="num"><input type="number" min="0" step="1" value="${l.result.suggested}" data-upc="${l.upc}" class="od-qty" style="width:76px"></td>
+        <td class="num"><span class="od-num"><input type="number" min="0" step="1" value="${l.result.suggested}" data-upc="${l.upc}" class="od-qty" style="width:64px">
+          <span class="od-num-arrows"><button type="button" class="od-qty-up" data-upc="${l.upc}" tabindex="-1" aria-label="increment">▲</button><button type="button" class="od-qty-down" data-upc="${l.upc}" tabindex="-1" aria-label="decrement">▼</button></span></span></td>
         <td class="num" data-total="${l.upc}">${fmt$(l.result.suggested * l.unit_cost)}</td>
       </tr>`).join("");
     $("od-post-group").style.display = "inline-flex";
@@ -150,7 +152,40 @@ export async function render(el, { API, SERVER }) {
       inp.oninput = () => {
         el.querySelector(`[data-total="${inp.dataset.upc}"]`).textContent = fmt$(+inp.value * lineFor(inp.dataset.upc).unit_cost);
       };
+      // keyboard nav: Enter/Tab move to next qty box, Shift+Tab previous;
+      // selecting a box selects its value so the operator can type over it.
+      inp.addEventListener("keydown", (e) => {
+        if (e.key === "Tab" || e.key === "Enter") {
+          e.preventDefault();
+          const all = Array.from(el.querySelectorAll(".od-qty"));
+          const idx = all.indexOf(inp);
+          const dir = (e.key === "Tab" && e.shiftKey) ? -1 : 1;
+          const next = all[idx + dir];
+          if (next) next.focus();
+          else if (e.key === "Enter") inp.blur();
+        } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+          e.preventDefault();
+          const cur = parseFloat(inp.value) || 0;
+          inp.value = String(Math.max(0, cur + (e.key === "ArrowUp" ? 1 : -1)));
+          inp.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      });
+      inp.addEventListener("focus", () => inp.select());
     }
+    // custom steppers: step the qty and re-fire input
+    el.querySelectorAll(".od-num").forEach((wrap) => {
+      const inp = wrap.querySelector("input");
+      const up = wrap.querySelector(".od-qty-up");
+      const down = wrap.querySelector(".od-qty-down");
+      const step = (dir) => {
+        if (!inp) return;
+        const cur = parseFloat(inp.value) || 0;
+        inp.value = String(Math.max(0, cur + dir));
+        inp.dispatchEvent(new Event("input", { bubbles: true }));
+      };
+      if (up) up.onclick = () => step(1);
+      if (down) down.onclick = () => step(-1);
+    });
   }
   function lineFor(upc) { return sheet.find((l) => l.upc === upc) || { unit_cost: 0 }; }
 
@@ -192,6 +227,8 @@ export async function render(el, { API, SERVER }) {
     } catch (e) { $("od-msg").className = "msg error"; $("od-msg").textContent = e.message; }
   };
 
+  $("od-print").onclick = () => printSheet(sheet);
+
   $("od-export").onclick = async () => {
     const lines = qtyLines();
     if (!lines.length) { $("od-msg").className = "msg warn"; $("od-msg").textContent = "No quantities entered."; return; }
@@ -208,6 +245,37 @@ export async function render(el, { API, SERVER }) {
   };
 }
 
+function printSheet(sheet) {
+  if (!sheet || !sheet.length) return;
+  const qtyOf = (upc) => document.querySelector(`.od-qty[data-upc="${upc}"]`)?.value ?? "";
+  const lines = sheet.filter((l) => +qtyOf(l.upc) > 0 || (l.result && l.result.suggested > 0)).slice(0, 200);
+  const asOf = new Date().toLocaleString();
+  const rows = lines.map((l) => `<tr>
+      <td class="l">${esc(l.description)}<div style="color:#888;font-size:10px">${esc(l.upc)}</div></td>
+      <td>${l.result && l.result.rate30 ? l.result.rate30.toFixed(2) : "—"}</td>
+      <td>${l.on_hand}</td><td>${l.on_order}</td>
+      <td>${l.result ? l.result.sellout_days : ""}</td>
+      <td>${l.result ? l.result.suggested : ""}</td>
+      <td>${esc(qtyOf(l.upc)) || (l.result ? l.result.suggested : 0)}</td>
+    </tr>`).join("");
+  const w = window.open("", "_blank", "width=900,height=700");
+  if (!w) return;
+  w.document.write(`<html><head><title>Order Sheet</title><style>
+    body{font-family:system-ui,sans-serif;margin:24px;color:#222}
+    h1{font-size:18px;margin:0 0 4px}.sub{color:#666;font-size:12px;margin-bottom:14px}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th,td{border:1px solid #ccc;padding:4px 6px;text-align:right}
+    th{background:#f0f0f0}.l{text-align:left}
+    @media print{body{margin:8mm}}
+  </style></head><body>
+    <h1>Supplier Order Sheet</h1>
+    <div class="sub">${asOf} · ${lines.length} lines</div>
+    <table><thead><tr><th class="l">Description</th><th>Fwd/Day</th><th>SOH</th><th>OnOrder</th><th>Sellout</th><th>Suggested</th><th class="l">Qty</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <script>window.onload=function(){setTimeout(function(){window.print();},300)}<\/script>
+  </body></html>`);
+  w.document.close();
+}
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
 function fmt$(v) { return "$" + (v || 0).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
 function download(name, content, type) {

@@ -15,6 +15,9 @@ export async function render(el, { API, SERVER }) {
       <label>Dept</label>
       <select id="st-dept"><option value="ALL">All departments</option>
         ${depts.map((d) => `<option value="${d.id}">${d.label}</option>`).join("")}</select>
+      <label>Supplier</label>
+      <select id="st-supplier"><option value="ALL">All suppliers</option></select>
+      <label class="chk"><input type="checkbox" id="st-uncounted"> uncounted only</label>
       <input type="search" id="st-q" placeholder="Scan barcode or search (UPC / name)…" autofocus style="min-width:280px">
       <button id="st-search" class="secondary">Search</button>
       <div class="btn-group" style="margin-left:auto">
@@ -34,6 +37,15 @@ export async function render(el, { API, SERVER }) {
 
   const $ = (id) => el.querySelector(id.startsWith("#") ? id : "#" + id);
   const qEl = () => $("st-q");
+  async function loadSuppliers(deptId) {
+    try {
+      const s = await API.get(`/api/stocktake/suppliers-for-dept?dept=${deptId}`);
+      const sel = $("st-supplier");
+      const list = Array.isArray(s) ? s : (s.suppliers || []);
+      sel.innerHTML = `<option value="ALL">All suppliers</option>` + list.map((x) => `<option value="${x.code}">${esc(x.name || x.label || x.code)}</option>`).join("");
+    } catch { /* optional */ }
+  }
+  loadSuppliers("ALL");
   const msg = (t, cls) => { $("st-msg").className = cls ? `msg ${cls}` : "msg"; $("st-msg").textContent = t; };
   // session: upc → row (description/department/supplier/soh filled on add)
   const session = new Map();
@@ -68,7 +80,8 @@ export async function render(el, { API, SERVER }) {
     try {
       const qs = q ? `&q=${encodeURIComponent(q)}` : "";
       const ds = dept !== "ALL" ? `&dept=${dept}` : "";
-      const d = await API.get(`/api/stocktake/search?branch=${branch}${qs}${ds}`);
+      const ss = supplierFilter !== "ALL" ? `&supplier=${supplierFilter}` : "";
+      const d = await API.get(`/api/stocktake/search?branch=${branch}${qs}${ds}${ss}`);
       const items = d.items || [];
       for (const it of items) {
         if (!session.has(it.upc)) {
@@ -90,8 +103,14 @@ export async function render(el, { API, SERVER }) {
     } catch (e) { msg(e.message, "error"); }
   }
 
+  let uncountedOnly = false;
+  let supplierFilter = "ALL";
   function renderRows() {
-    const rows = [...session.values()];
+    const rows = [...session.values()].filter((r) => {
+      if (uncountedOnly && r.count !== null && r.count !== "") return false;
+      if (supplierFilter !== "ALL" && r.supplier !== supplierFilter) return false;
+      return true;
+    });
     $("st-stats").style.display = rows.length ? "" : "none";
     const counted = rows.filter((r) => r.count !== null && r.count !== "");
     $("st-n").textContent = counted.length;
@@ -119,6 +138,16 @@ export async function render(el, { API, SERVER }) {
         renderRows();
         qEl().focus();
       };
+      inp.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        e.preventDefault();
+        const all = Array.from(el.querySelectorAll(".st-count"));
+        const idx = all.indexOf(inp);
+        const next = all[idx + 1];
+        if (next) next.focus();
+        else qEl().focus();
+      });
+      inp.addEventListener("focus", () => inp.select());
     }
     for (const b of el.querySelectorAll(".st-del")) {
       b.onclick = () => {
@@ -155,7 +184,9 @@ export async function render(el, { API, SERVER }) {
     if (/^[\d]{6,}$/.test(q)) { addUpc(q); qEl().value = ""; qEl().focus(); }
     else doSearch();
   };
-  $("st-dept").onchange = doSearch;
+  $("st-dept").onchange = () => { loadSuppliers($("st-dept").value); doSearch(); };
+  $("st-supplier").onchange = () => { supplierFilter = $("st-supplier").value; renderRows(); };
+  $("st-uncounted").onchange = () => { uncountedOnly = $("st-uncounted").checked; renderRows(); };
 
   $("st-save").onclick = async () => {
     const rows = saveRows();
